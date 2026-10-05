@@ -1,0 +1,152 @@
+import numpy as np
+
+from camera.source import filter_depth, remove_flying_pixels
+from cube.detect import detect_visible_cube
+from cube.face_fallback import fit_when_face_missing
+from field.extrinsic import Segment, estimate_from_lines, save_extrinsic, load_extrinsic
+from fuse.median import average_scores, band_score, fuse_poses, score_trial
+from geom.transform import compose_R, fold_yaw_quarter, world_to_camera
+from ground.plane import Plane, fit_ground
+from main import estimate_frame, load_config
+from camera.source import Frame
+from sim.scene import intrinsics_for, render_cube
+
+
+def test_flying_pixels_removed():
+    depth = np.ones((9, 9))
+    depth[4, 4] = 2.0
+    cleaned = remove_flying_pixels(depth, 0.2)
+    assert not np.isfinite(cleaned[4, 4])
+    assert np.isfinite(cleaned[1, 1])
+
+
+def test_ground_rejects_tilted_normal():
+    rng = np.random.default_rng(1)
+    xy = rng.uniform(-1, 1, size=(400, 2))
+    pts = np.column_stack([xy, np.full(len(xy), 1.5)])
+    pts += rng.normal(0, 0.002, pts.shape)
+    gravity = np.array([0.0, 0.0, 1.0])
+    plane = fit_ground(pts, gravity, max_angle_deg=8.0)
+    assert plane is not None
+    assert abs(plane.signed_distance(np.array([0.0, 0.0, 1.5]))) < 0.01
+    tilted = pts.copy()
+    tilted[:, 2] = 1.5 + 0.4 * tilted[:, 0]
+    assert fit_ground(tilted, gravity, max_angle_deg=8.0) is None
+
+
+def test_visible_cube_pose_within_tolerance():
+    intr = intrinsics_for(320, 240)
+    center = np.array([0.70, 0.35, 2.0])
+    yaw = 0.35
+    color, depth = render_cube(intr, center, yaw, noise_m=0.004, seed=2, top_bgr=(255, 80, 40))
+    cfg = load_config("config/default.yaml")
+    depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
+    from ground.plane import sample_points
+
+    plane = fit_ground(sample_points(depth_f, intr, stride=3), np.array([0.0, 0.0, 1.0]))
+    assert plane is not None
+    pose = detect_visible_cube(
+        color,
+        depth_f,
+        intr,
+        plane,
+        cfg["colors"],
+        cube_size=0.6,
+        min_pixels=200,
+        min_footprint_fraction=0.35,
+        size_tolerance=0.2,
+    )
+    assert pose is not None
+    assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.03
+    assert abs(fold_yaw_quarter(pose.yaw - yaw)) < np.deg2rad(3.0)
+
+
+def test_field_corner_recovers_extrinsic(tmp_path):
+    rotation = compose_R(0.2, -0.35, 0.05)
+    translation = np.array([0.3, -0.2, 1.4])
+    normal = rotation @ np.array([0.0, 0.0, 1.0])
+    plane = Plane(normal=normal, offset=float(normal @ translation))
+    origin = world_to_camera(np.zeros(3), rotation, translation)
+    long_end = world_to_camera(np.array([2.0, 0.0, 0.0]), rotation, translation)
+    short_end = world_to_camera(np.array([0.0, 1.2, 0.0]), rotation, translation)
+    pose = estimate_from_lines(
+        [Segment(origin, long_end), Segment(origin, short_end)],
+        plane,
+        2.0,
+        1.2,
+    )
+    assert pose is not None
+    est_r, est_t = pose
+    np.testing.assert_allclose(est_t, translation, atol=1e-6)
+    np.testing.assert_allclose(est_r, rotation, atol=1e-6)
+    path = tmp_path / "extrinsic.yaml"
+    save_extrinsic(path, est_r, est_t)
+    loaded_r, loaded_t = load_extrinsic(path)
+    np.testing.assert_allclose(loaded_r, est_r)
+    np.testing.assert_allclose(loaded_t, est_t)
+
+
+def test_fuse_and_score_bands():
+    assert band_score(0.04) == 4
+    assert band_score(0.12) == 2
+    assert band_score(0.25) == 0
+    samples = [{"x": 1.0, "y": 0.5, "z": 0.0, "yaw": 0.2} for _ in range(8)]
+    samples.append({"x": 4.0, "y": 4.0, "z": 0.0, "yaw": 2.5})
+    fused = fuse_poses(samples)
+    assert abs(fused.x - 1.0) < 1e-6
+    assert abs(fused.yaw - 0.2) < 1e-6
+    trial = score_trial(np.array([1.0, 0.0]), 0.0, np.array([1.02, 0.0]), 0.01)
+    assert trial["position_score"] == 4
+    summary = average_scores([trial, trial, trial])
+    assert summary["basic_passed"]
+
+
+def test_face_fallback_on_single_face():
+    intr = intrinsics_for(320, 240)
+    cfg = load_config("config/default.yaml")
+    rotation = compose_R(0.15, -0.7, 0.0)
+    translation = np.array([0.2, 0.1, 1.5])
+    center = np.array([0.4, 0.3, 0.0])
+    yaw = 0.25
+    color, depth = _render_front_face(intr, rotation, translation, center, yaw)
+    gravity = rotation @ np.array([0.0, 0.0, -1.0])
+    frame = Frame(color, depth, gravity)
+    basic = estimate_frame(frame, intr, cfg, rotation, translation)
+    assert basic is None
+    from ground.plane import sample_points
+
+    depth_f = filter_depth(depth, 0.3, 3.0, 0.08)
+    plane = fit_ground(sample_points(depth_f, intr, stride=2), gravity)
+    assert plane is not None
+    pose = fit_when_face_missing(color, depth_f, intr, plane, cfg["colors"], cube_size=0.6, rotation=rotation, translation=translation)
+    assert pose is not None
+    from geom.transform import camera_to_world
+
+    recovered = camera_to_world(pose.bottom_center, rotation, translation)
+    assert np.linalg.norm(recovered[:2] - center[:2]) < 0.08
+    assert abs(fold_yaw_quarter(pose.yaw - yaw)) < np.deg2rad(12)
+
+
+def _render_front_face(intr, rotation, translation, center, yaw):
+    from sim.scene import _face, _paint
+
+    image = np.full((intr.height, intr.width, 3), 40, dtype=np.uint8)
+    depth = np.full((intr.height, intr.width), np.nan)
+    xs = np.linspace(center[0] - 1.0, center[0] + 1.0, 60)
+    ys = np.linspace(center[1] - 1.0, center[1] + 1.0, 60)
+    gx, gy = np.meshgrid(xs, ys)
+    ground_w = np.column_stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)])
+    ground = world_to_camera(ground_w, rotation, translation)
+    keep = ground[:, 2] > 0.2
+    _paint(ground[keep], np.full((int(keep.sum()), 3), 40, np.uint8), intr, depth, image)
+    size = 0.6
+    c, s = np.cos(yaw), np.sin(yaw)
+    axis_x = rotation @ np.array([c, s, 0.0]) * size
+    axis_y = rotation @ np.array([-s, c, 0.0]) * size
+    axis_z = rotation @ np.array([0.0, 0.0, size])
+    bottom = world_to_camera(center, rotation, translation)
+    front = bottom + axis_x * 0.5
+    pts, cols = _face(front, axis_y, axis_z, (255, 80, 40), samples=90)
+    ok = pts[:, 2] > 0.2
+    _paint(pts[ok], cols[ok], intr, depth, image)
+    return image, depth

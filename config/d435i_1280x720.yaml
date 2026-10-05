@@ -1,0 +1,18 @@
+# Color intrinsics of one D435i at 1280x720, from rs-enumerate-devices -c.
+# Source: https://github.com/IntelRealSense/realsense-ros/issues/2456
+# Each unit has its own factory calibration. These values are that camera's
+# color stream: FOV 70.31 x 43.22 deg, which sits inside the datasheet RGB
+# FOV of 69.4 x 42.5 deg (+/- 3 deg).
+# The assignment's 87 x 58 deg field of view is the depth stream. Frames here
+# are aligned to color, so deprojection uses the color intrinsics.
+# D400 images are rectified in the D4, so the five Brown-Conrady coefficients
+# are zero and the model name stays Inverse Brown-Conrady.
+width: 1280
+height: 720
+fx: 908.771240234375
+fy: 908.71630859375
+cx: 645.505981445312
+cy: 353.784606933594
+distortion_model: inverse_brown_conrady
+# D = (k1, k2, p1, p2, k3)
+D: [0.0, 0.0, 0.0, 0.0, 0.0]

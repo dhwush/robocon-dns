@@ -1,0 +1,43 @@
+{
+  "basic": {
+    "position": 4.0,
+    "yaw": 4.0,
+    "total": 8.0,
+    "basic_passed": true
+  },
+  "advanced": {
+    "position": 4.0,
+    "yaw": 4.0,
+    "total": 8.0,
+    "basic_passed": true
+  },
+  "stations": [
+    {
+      "name": "station_0",
+      "summary": {
+        "position": 4.0,
+        "yaw": 4.0,
+        "total": 8.0,
+        "basic_passed": true
+      }
+    },
+    {
+      "name": "station_1",
+      "summary": {
+        "position": 4.0,
+        "yaw": 4.0,
+        "total": 8.0,
+        "basic_passed": true
+      }
+    },
+    {
+      "name": "station_2",
+      "summary": {
+        "position": 4.0,
+        "yaw": 4.0,
+        "total": 8.0,
+        "basic_passed": true
+      }
+    }
+  ]
+}
