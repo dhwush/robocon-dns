@@ -1,4 +1,4 @@
-"""Generate exam PNGs, run the pose pipeline, and write overlay images."""
+"""生成考试用 PNG，跑位姿流程，并写出叠加了估计结果的图。"""
 
 from __future__ import annotations
 
@@ -33,6 +33,9 @@ FIELD_LENGTH = 2.0
 FIELD_WIDTH = 1.2
 CUBE = 0.6
 
+
+# --- 场景描述 -----------------------------------------------------------------
+# 基础要求：俯视、三个方块。提高要求：三个相机点位，每点三个方块。
 
 def _cube(x, y, yaw, top, front=None, z=0.0):
     return {
@@ -183,14 +186,25 @@ def _frame(name: str, gravity: np.ndarray) -> Frame:
     return Frame(color, depth, gravity)
 
 
+# --- 打分与可视化 -------------------------------------------------------------
+# 按作业分档比较 x、y 和 yaw。方框画在地面高度上，因为输出的 z 是几何中心，不是足迹所在的地面。
+
 def _score_pose(est: dict | None, gt: dict) -> dict:
     if est is None:
         return {"position_error": 1.0, "yaw_error": 1.0, "position_score": 0, "yaw_score": 0, "est": None}
     if gt["marked"]:
         est_yaw, gt_yaw = est["yaw"], gt["yaw"]
+        quarter = False
     else:
         est_yaw, gt_yaw = fold_yaw_quarter(est["yaw"]), fold_yaw_quarter(gt["yaw"])
-    trial = score_trial(np.array([est["x"], est["y"]]), est_yaw, np.array([gt["x"], gt["y"]]), gt_yaw)
+        quarter = True
+    trial = score_trial(
+        np.array([est["x"], est["y"]]),
+        est_yaw,
+        np.array([gt["x"], gt["y"]]),
+        gt_yaw,
+        quarter=quarter,
+    )
     trial["est"] = {"x": est["x"], "y": est["y"], "z": est["z"], "yaw": est["yaw"]}
     return trial
 
@@ -237,7 +251,7 @@ def _basic_overlay(intr, name: str, gt: dict, trial: dict) -> None:
     est = trial["est"]
     lines = [f"gt  x={gt['x']:.3f} y={gt['y']:.3f} yaw={np.degrees(gt['yaw']):.1f} deg"]
     if est is not None:
-        est_square = _square(np.array([est["x"], est["y"], est["z"]]), est["yaw"], gt["size"])
+        est_square = _square(np.array([est["x"], est["y"], gt["z"]]), est["yaw"], gt["size"])
         _draw_square(color, intr, est_square, (0, 255, 0))
         lines.insert(0, f"est x={est['x']:.3f} y={est['y']:.3f} yaw={np.degrees(est['yaw']):.1f} deg")
         lines.append(f"score pos={trial['position_score']} yaw={trial['yaw_score']}")
@@ -253,7 +267,7 @@ def _world_overlay(intr, rotation, translation, name: str, gt: dict | None, tria
         _draw_square(color, intr, world_to_camera(gt_square, rotation, translation), (0, 255, 255))
     est = None if trial is None else trial.get("est")
     if est is not None and gt is not None:
-        est_square = _square(np.array([est["x"], est["y"], est["z"]]), est["yaw"], gt["size"])
+        est_square = _square(np.array([est["x"], est["y"], gt["z"]]), est["yaw"], gt["size"])
         _draw_square(color, intr, world_to_camera(est_square, rotation, translation), (0, 255, 0))
     if trial is None:
         lines = ["calibration frame"]

@@ -1,3 +1,5 @@
+# 坐标链：印刷体旋转复合、世界/相机往返、两种畸变模型的投影往返、配置内参不被改写。
+
 import numpy as np
 
 from geom.transform import (
@@ -16,6 +18,7 @@ from geom.transform import (
 
 
 def test_printed_composition_matches_expansion():
+    """R = Rz(φ) Ry(θ) Rx(ψ) 必须等于课件展开式，也等于三个单轴矩阵按该顺序相乘。"""
     phi, theta, psi = 0.4, -0.25, 0.7
     got = compose_R(phi, theta, psi)
     cph, sph = np.cos(phi), np.sin(phi)
@@ -33,6 +36,7 @@ def test_printed_composition_matches_expansion():
 
 
 def test_world_camera_roundtrip():
+    """一组世界点变到相机系再变回来，应回到原点，误差只在浮点噪声内。"""
     rotation = compose_R(0.2, -0.3, 0.5)
     translation = np.array([0.1, -0.2, 0.4])
     points = np.array([[1.0, 0.2, 0.0], [0.0, 1.5, 0.3], [-0.4, 0.3, 1.2]])
@@ -41,11 +45,14 @@ def test_world_camera_roundtrip():
 
 
 def _sample_intrinsics(model: str, distorted: bool) -> Intrinsics:
+    """构造一组固定内参。distorted 为真时带上非零的 k1、k2、p1、p2、k3。"""
     d = [0.08, -0.03, 0.001, -0.002, 0.01] if distorted else [0.0, 0.0, 0.0, 0.0, 0.0]
     return Intrinsics(640, 480, 600.0, 610.0, 320.0, 240.0, *d, distortion_model=model)
 
 
 def test_projection_roundtrip_both_models():
+    """Brown 和 Inverse Brown Conrady、有无畸变四种组合：投影到像素再用原深度反投影，
+    相机系点误差小于 0.1 mm。"""
     points = np.array(
         [
             [0.10, -0.05, 1.2],
@@ -64,6 +71,7 @@ def test_projection_roundtrip_both_models():
 
 
 def test_linear_matrix_matches_pinhole_when_no_distortion():
+    """无畸变时，课件的 M1 M2 矩阵投影应和先变到相机系再做小孔投影的结果一致。"""
     intr = _sample_intrinsics("none", False)
     rotation = compose_R(0.15, 0.05, -0.2)
     translation = np.array([0.0, 0.1, 0.0])
@@ -75,6 +83,7 @@ def test_linear_matrix_matches_pinhole_when_no_distortion():
 
 
 def test_config_intrinsics_are_the_only_source():
+    """配置文件里的模型、分辨率和 fx 原样读入。用这组内参做一次投影再反投影，点能回来。"""
     intr = load_intrinsics("config/intrinsics.yaml")
     assert intr.distortion_model == "inverse_brown_conrady"
     assert intr.width == 1280

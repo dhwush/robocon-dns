@@ -1,7 +1,6 @@
-"""Solid-color exam scenes rendered with the published D435i color model.
+"""按公布的 D435i 彩色模型渲染考试用场景。
 
-Color frames are 8-bit BGR PNGs. Depth frames are 16-bit PNGs in millimeters;
-a value of 0 means the pixel has no depth.
+彩色是 8 位 BGR PNG。深度是 16 位 PNG，单位毫米，0 表示没有深度。
 """
 
 from __future__ import annotations
@@ -25,6 +24,9 @@ RED_BGR = (40, 40, 220)
 GREEN_BGR = (40, 160, 40)
 WHITE_BGR = (235, 235, 235)
 
+
+# --- 多边形光栅化 -------------------------------------------------------------
+# 相机前方的凸多边形先裁到 z >= zmin，再填进彩色图和深度图。
 
 def clip_near(poly: np.ndarray, zmin: float = 0.25) -> np.ndarray:
     """Clip a convex polygon to the camera half-space z >= zmin."""
@@ -124,6 +126,9 @@ def box_polygons(
     return faces
 
 
+# --- 噪声与场地 ---------------------------------------------------------------
+# 深度噪声和空洞用来模拟 D435i。场地边和方块分开画，标定与识别不必同框。
+
 def blank(intr) -> tuple[np.ndarray, np.ndarray]:
     color = np.full((intr.height, intr.width, 3), 30, dtype=np.uint8)
     depth = np.full((intr.height, intr.width), np.nan, dtype=float)
@@ -176,6 +181,10 @@ def look_at(camera_world: np.ndarray, target_world: np.ndarray) -> tuple[np.ndar
     translation = -rotation @ np.asarray(camera_world, dtype=float)
     return rotation, translation
 
+
+# --- 两种机位 -----------------------------------------------------------------
+# render_nadir：相机在原点俯视，对应基础要求。
+# render_field：相机离开原点，世界系由场地边定义，对应提高要求。
 
 def render_nadir(
     intr,

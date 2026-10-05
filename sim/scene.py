@@ -1,4 +1,4 @@
-"""Rasterize a yaw-only cube and a rectangular field into color and depth."""
+"""合成彩色图和深度图，供没有相机时的自检使用。"""
 
 from __future__ import annotations
 
@@ -7,11 +7,18 @@ import numpy as np
 from geom.transform import Intrinsics, project_points, world_to_camera
 
 
+# --- 与作业视场一致的内参 -----------------------------------------------------
+# 水平 87°、垂直 58°，主点在图像中心。自检不使用配置文件里的 1280×720 数值。
+
 def intrinsics_for(width: int, height: int, model: str = "inverse_brown_conrady") -> Intrinsics:
+    # 半幅 / tan(半视场角) 就是焦距（像素）。和作业给出的 87°×58° 一致。
     fx = (width / 2.0) / np.tan(np.deg2rad(87.0 / 2.0))
     fy = (height / 2.0) / np.tan(np.deg2rad(58.0 / 2.0))
     return Intrinsics(width, height, float(fx), float(fy), width / 2.0, height / 2.0, 0, 0, 0, 0, 0, model)
 
+
+# --- 光栅化 -------------------------------------------------------------------
+# 同一像素保留更近的深度。面由均匀采样的点拼出。
 
 def _paint(points: np.ndarray, colors: np.ndarray, intr: Intrinsics, depth: np.ndarray, image: np.ndarray) -> None:
     if len(points) == 0:
@@ -20,6 +27,7 @@ def _paint(points: np.ndarray, colors: np.ndarray, intr: Intrinsics, depth: np.n
     z = points[:, 2]
     ui = np.rint(pixels[:, 0]).astype(int)
     vi = np.rint(pixels[:, 1]).astype(int)
+    # 相机后方和画面外的点不画。
     inside = (z > 0.05) & (ui >= 0) & (ui < intr.width) & (vi >= 0) & (vi < intr.height)
     if not np.any(inside):
         return
@@ -28,6 +36,7 @@ def _paint(points: np.ndarray, colors: np.ndarray, intr: Intrinsics, depth: np.n
     z = z[inside]
     cols = colors[inside]
     pix = vi * intr.width + ui
+    # 按像素分组、组内按深度从小到大，unique 保留每组第一个，也就是最近的点。
     order = np.lexsort((z, pix))
     _, first = np.unique(pix[order], return_index=True)
     chosen = order[first]
@@ -37,6 +46,7 @@ def _paint(points: np.ndarray, colors: np.ndarray, intr: Intrinsics, depth: np.n
 
 
 def _face(origin, axis_a, axis_b, color, samples: int = 120) -> tuple[np.ndarray, np.ndarray]:
+    # axis 向量的长度已经是边长，参数从 -0.5 到 0.5 正好铺满这个面。
     aa = np.linspace(-0.5, 0.5, samples)
     bb = np.linspace(-0.5, 0.5, samples)
     grid_a, grid_b = np.meshgrid(aa, bb)
@@ -44,6 +54,9 @@ def _face(origin, axis_a, axis_b, color, samples: int = 120) -> tuple[np.ndarray
     cols = np.repeat(np.array(color, dtype=np.uint8)[None, :], len(pts), axis=0)
     return pts, cols
 
+
+# --- 俯视方块 -----------------------------------------------------------------
+# 相机 +Z 指向地面，相机系就是世界系。可只画顶面或正面，用来试“看不清面”的分支。
 
 def render_cube(
     intr: Intrinsics,
@@ -57,7 +70,7 @@ def render_cube(
     seed: int = 0,
     faces: str = "all",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Top-down camera: +Z points at the ground, world frame is the camera frame."""
+    """俯视：相机 +Z 指向地面，这一帧的世界系就是相机系，不用文档 2.3 的水平向前旋转。"""
     image = np.full((intr.height, intr.width, 3), 40, dtype=np.uint8)
     depth = np.full((intr.height, intr.width), np.nan, dtype=float)
     ground = []
@@ -95,6 +108,9 @@ def render_cube(
         depth[holes] = np.nan
     return image, depth
 
+
+# --- 斜视场地 -----------------------------------------------------------------
+# 地面点在世界系 z = 0，四条边画成深色直线，给外参标定用。
 
 def render_field(
     intr: Intrinsics,

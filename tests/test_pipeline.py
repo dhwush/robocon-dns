@@ -1,10 +1,12 @@
+# 流水线：飞点、地面重力约束、可见面位姿、场地角外参、多帧评分、看不清面时的补救。
+
 import numpy as np
 
 from camera.source import filter_depth, remove_flying_pixels
 from cube.detect import detect_visible_cube
 from cube.face_fallback import fit_when_face_missing
 from field.extrinsic import Segment, estimate_from_lines, save_extrinsic, load_extrinsic
-from fuse.median import average_scores, band_score, fuse_poses, score_trial
+from fuse.median import angle_delta, average_scores, band_score, fuse_poses, score_trial
 from geom.transform import compose_R, fold_yaw_quarter, world_to_camera
 from ground.plane import Plane, fit_ground
 from main import estimate_frame, load_config
@@ -13,6 +15,7 @@ from sim.scene import intrinsics_for, render_cube
 
 
 def test_flying_pixels_removed():
+    """一块平坦深度里只有中心像素跳了 1 m。飞点滤波应删掉它，邻域里的平坦像素保留。"""
     depth = np.ones((9, 9))
     depth[4, 4] = 2.0
     cleaned = remove_flying_pixels(depth, 0.2)
@@ -21,6 +24,8 @@ def test_flying_pixels_removed():
 
 
 def test_ground_rejects_tilted_normal():
+    """重力沿 +Z 时，z = 1.5 的水平点云应拟合成功，点到平面的距离小于 1 cm。
+    把高度改成随 x 倾斜约 22° 后，法向和重力夹角超过 8°，拟合必须拒绝。"""
     rng = np.random.default_rng(1)
     xy = rng.uniform(-1, 1, size=(400, 2))
     pts = np.column_stack([xy, np.full(len(xy), 1.5)])
@@ -35,6 +40,8 @@ def test_ground_rejects_tilted_normal():
 
 
 def test_visible_cube_pose_within_tolerance():
+    """俯视渲染一个带 4 mm 深度噪声的 0.6 m 方块。可见面检测的底面中心误差要小于 3 cm，
+    yaw 按 90° 对称折返后与真值相差小于 3°。"""
     intr = intrinsics_for(320, 240)
     center = np.array([0.70, 0.35, 2.0])
     yaw = 0.35
@@ -62,6 +69,8 @@ def test_visible_cube_pose_within_tolerance():
 
 
 def test_field_corner_recovers_extrinsic(tmp_path):
+    """已知外参下，原点出发的长边 2 m 和短边 1.2 m 应解回同一组 R、t。
+    写入 yaml 再读回，数值不变。"""
     rotation = compose_R(0.2, -0.35, 0.05)
     translation = np.array([0.3, -0.2, 1.4])
     normal = rotation @ np.array([0.0, 0.0, 1.0])
@@ -87,6 +96,8 @@ def test_field_corner_recovers_extrinsic(tmp_path):
 
 
 def test_fuse_and_score_bands():
+    """核对作业分档：4%、12%、25% 分别是 4 分、2 分、0 分。
+    八帧正常位姿加一帧离群点，融合结果应落在正常值上；三次满分的平均通过基础要求。"""
     assert band_score(0.04) == 4
     assert band_score(0.12) == 2
     assert band_score(0.25) == 0
@@ -99,9 +110,17 @@ def test_fuse_and_score_bands():
     assert trial["position_score"] == 4
     summary = average_scores([trial, trial, trial])
     assert summary["basic_passed"]
+    # 真值 y = 0 落在 0.15 m 以内，百分比会过敏，评分分母仍用这个下限。
+    assert trial["sensitive_percent"]
+    near = [{"x": 1.0, "y": 0.2, "z": 0.0, "yaw": 0.78, "quarter": True} for _ in range(4)]
+    near += [{"x": 1.0, "y": 0.2, "z": 0.0, "yaw": -0.76, "quarter": True} for _ in range(4)]
+    folded = fuse_poses(near)
+    assert abs(angle_delta(folded.yaw, 0.77, True)) < np.deg2rad(3.0)
 
 
 def test_face_fallback_on_single_face():
+    """斜视时只画方块的正面。可见面检测应拒绝；贴地模型补救的平面位置误差小于 8 cm，
+    折叠后的 yaw 误差小于 12°。"""
     intr = intrinsics_for(320, 240)
     cfg = load_config("config/default.yaml")
     rotation = compose_R(0.15, -0.7, 0.0)
@@ -128,6 +147,7 @@ def test_face_fallback_on_single_face():
 
 
 def _render_front_face(intr, rotation, translation, center, yaw):
+    """给补救测试用：世界系地面加上方块朝 +X 的那一个竖直面，不画顶面和其他侧面。"""
     from sim.scene import _face, _paint
 
     image = np.full((intr.height, intr.width, 3), 40, dtype=np.uint8)
