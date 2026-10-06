@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+import threading
 
 import numpy as np
 
@@ -18,6 +20,8 @@ class Frame:
     color: np.ndarray
     depth: np.ndarray
     gravity: np.ndarray | None = None
+    # 彩色相机系角速度 (时间戳秒, rad/s)。没有陀螺仪时为空，跟踪只靠视觉和场地边。
+    gyro: list | None = None
 
 
 # --- 深度清洗 -----------------------------------------------------------------
@@ -136,33 +140,96 @@ class RealSenseSource:
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
         config.enable_stream(rs.stream.accel)
-        self.profile = self.pipeline.start(config)
-        # 深度对齐到彩色，后面的像素才能和颜色掩膜共用同一套 (u, v)。
+        config.enable_stream(rs.stream.gyro)
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._pending: tuple | None = None
+        self._gyro: deque = deque(maxlen=400)
+        self._gyro_to_color = np.eye(3)
+        self._accel_to_color = np.eye(3)
+        self._gyro_ready = False
+        self._video_ready = False
+        self.depth_scale = 0.001
+        # 对齐和滤波要在启动回调之前建好，否则第一帧进来时还没有这些对象。
         self.align = rs.align(rs.stream.color)
-        self.depth_scale = self.profile.get_device().first_depth_sensor().get_depth_scale()
-        # 视差域里做空间/时间滤波更符合立体匹配的噪声形态，做完再变回深度。
         self.to_disp = rs.disparity_transform(True)
         self.to_depth = rs.disparity_transform(False)
         self.spatial = rs.spatial_filter()
-        # 空间滤波保留边缘。holes_fill 置 0，避免强空洞填充把方块边缘拉进背景。
         try:
             self.spatial.set_option(rs.option.holes_fill, 0)
         except Exception:
             pass
         self.temporal_rs = rs.temporal_filter()
+        try:
+            self.profile = self.pipeline.start(config, self._on_frame)
+            self._gyro_on = True
+        except Exception:
+            # D435 没有陀螺仪时关掉该流再启动。视觉跟踪和场地边仍然可用。
+            self.pipeline = rs.pipeline()
+            config.disable_stream(rs.stream.gyro)
+            self.profile = self.pipeline.start(config, self._on_frame)
+            self._gyro_on = False
+        self.depth_scale = self.profile.get_device().first_depth_sensor().get_depth_scale()
         self._accel_to_color = self._accel_rotation()
+        if self._gyro_on:
+            self._gyro_to_color = self._motion_rotation(rs.stream.gyro)
+        self._video_ready = True
+        self._gyro_ready = True
         self._lock_color()
 
     def _accel_rotation(self) -> np.ndarray:
-        rs = self._rs
+        return self._motion_rotation(self._rs.stream.accel)
+
+    def _motion_rotation(self, stream) -> np.ndarray:
         try:
-            # 加速度计坐标系和彩色相机不一致，要用设备外参旋过来。失败时退回单位阵。
-            accel = self.profile.get_stream(rs.stream.accel).as_motion_stream_profile()
-            color = self.profile.get_stream(rs.stream.color)
-            ext = accel.get_extrinsics_to(color)
+            # 惯性系和彩色相机不一致，要用设备外参旋过来。失败时退回单位阵。
+            motion = self.profile.get_stream(stream).as_motion_stream_profile()
+            color = self.profile.get_stream(self._rs.stream.color)
+            ext = motion.get_extrinsics_to(color)
             return np.array(ext.rotation, dtype=float).reshape(3, 3)
         except Exception:
             return np.eye(3)
+
+    def _on_frame(self, frame) -> None:
+        # 回调里把彩色帧和陀螺样品拆开。图像速率约 30 Hz，陀螺约 200 Hz，不能只留每个图像帧上的一颗陀螺。
+        rs = self._rs
+        if frame.is_frameset():
+            if not self._video_ready:
+                return
+            aligned = self.align.process(frame.as_frameset())
+            depth_frame = aligned.get_depth_frame()
+            color_frame = aligned.get_color_frame()
+            if not depth_frame or not color_frame:
+                return
+            filtered = self.to_depth.process(
+                self.temporal_rs.process(self.spatial.process(self.to_disp.process(depth_frame)))
+            )
+            depth = np.asanyarray(filtered.get_data()).astype(float) * self.depth_scale
+            color = np.asanyarray(color_frame.get_data()).copy()
+            gravity = None
+            accel = aligned.first_or_default(rs.stream.accel)
+            if accel is not None:
+                data = accel.as_motion_frame().get_motion_data()
+                specific = np.array([data.x, data.y, data.z], dtype=float)
+                up = self._accel_to_color @ specific
+                norm = np.linalg.norm(up)
+                if norm > 1.0:
+                    gravity = -up / norm
+            with self._lock:
+                gyro = list(self._gyro)
+                self._gyro.clear()
+                self._pending = (color, depth, gravity, gyro)
+            self._event.set()
+            return
+        if not self._gyro_ready or not frame.is_motion_frame():
+            return
+        motion = frame.as_motion_frame()
+        if motion.profile.stream_type() != rs.stream.gyro:
+            return
+        data = motion.get_motion_data()
+        omega = self._gyro_to_color @ np.array([data.x, data.y, data.z], dtype=float)
+        with self._lock:
+            self._gyro.append((float(motion.timestamp) * 1e-3, omega))
 
     def _lock_color(self) -> None:
         # 自动曝光在平台移动时会连跳，颜色阈值跟着漂。锁定曝光和白平衡。
@@ -177,29 +244,16 @@ class RealSenseSource:
             sensor.set_option(rs.option.enable_auto_white_balance, 0)
 
     def read(self) -> Frame:
-        frames = self.align.process(self.pipeline.wait_for_frames())
-        depth_frame = frames.get_depth_frame()
-        color_frame = frames.get_color_frame()
-        if not depth_frame or not color_frame:
+        if not self._event.wait(timeout=5.0):
             raise RuntimeError("missing color or depth frame")
-        # 深度 → 视差 → 空间滤波 → 时间滤波 → 视差回到深度。不补洞。
-        filtered = self.to_depth.process(
-            self.temporal_rs.process(self.spatial.process(self.to_disp.process(depth_frame)))
-        )
-        # z16 要乘深度尺度才是米。
-        depth = np.asanyarray(filtered.get_data()).astype(float) * self.depth_scale
-        color = np.asanyarray(color_frame.get_data())
-        gravity = None
-        accel = frames.first_or_default(self._rs.stream.accel)
-        if accel is not None:
-            data = accel.as_motion_frame().get_motion_data()
-            specific = np.array([data.x, data.y, data.z], dtype=float)
-            # 静止时加速度计测到的是支撑力，方向朝上。重力是它的反向单位向量。
-            up = self._accel_to_color @ specific
-            norm = np.linalg.norm(up)
-            if norm > 1.0:
-                gravity = -up / norm
-        return Frame(color=color, depth=depth, gravity=gravity)
+        self._event.clear()
+        with self._lock:
+            pending = self._pending
+            self._pending = None
+        if pending is None:
+            raise RuntimeError("missing color or depth frame")
+        color, depth, gravity, gyro = pending
+        return Frame(color=color, depth=depth, gravity=gravity, gyro=gyro)
 
     def close(self) -> None:
         self.pipeline.stop()

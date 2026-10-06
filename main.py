@@ -2,7 +2,7 @@
 
 作业基础要求只要求相机在世界原点，这里用单位旋转和零平移，世界系就是相机系。
 文档 2.3 那组固定旋转只在相机水平向前、光轴对齐场地 X 时成立；安装方向不同，不用那组矩阵。
-提高要求只要求相机挪走后仍给出世界系位姿。外参来自场地边标定，不用 AprilTag。
+提高要求的世界原点仍是起步时的相机。陀螺仪和视觉里程计连续跟踪，场地边看见时校正漂移。
 
 方块位置和 yaw 都来自地面足迹，不拟合上表面。上表面 RMS、与地面的 12° 夹角、
 6 mm 正方形残差没有对应平面，不参与丢帧。足迹的长边、短边和面积仍然丢帧。
@@ -24,9 +24,9 @@ from cube.detect import calibrate_hsv, detect_visible_cube, prepare_mask
 from field.extrinsic import (
     calibrate_from_image,
     identity_extrinsic,
-    load_extrinsic,
     save_extrinsic,
 )
+from field.motion import MotionTracker
 from fuse.median import average_scores, fuse_poses, score_trial
 from geom.transform import camera_to_world, load_intrinsics
 from ground.plane import fit_ground, sample_points
@@ -53,12 +53,15 @@ def _bump(rejects: dict | None, reason: str) -> None:
         rejects[reason] = int(rejects.get(reason, 0)) + 1
 
 
-def _ground_up_ok(plane, rotation: np.ndarray) -> bool:
+def _ground_up_ok(plane, rotation: np.ndarray, initial_up: np.ndarray | None = None) -> bool:
     # 单位外参时世界轴跟着相机走，不拿地面法向去对文档 2.3 的 +Z_W。
-    # 相机已经挪走、外参来自场地边时，世界 Z 向上，法向点积应不小于 0.95。
+    # 跟踪模式的世界 Z 是起步时光轴，不是竖直向上。法向要回到起步时记下的向上方向。
+    # 没有这个记录、外参又不是单位阵时，仍要求世界 Z 向上，供自检里的场地边外参使用。
+    up = rotation.T @ plane.normal
+    if initial_up is not None:
+        return float(up @ np.asarray(initial_up, dtype=float)) >= 0.95
     if np.allclose(rotation, np.eye(3), atol=1e-5):
         return True
-    up = rotation.T @ plane.normal
     return float(up[2]) >= 0.95
 
 
@@ -86,6 +89,7 @@ def estimate_frame(
     rotation: np.ndarray,
     translation: np.ndarray,
     rejects: dict | None = None,
+    initial_up: np.ndarray | None = None,
 ):
     # 深度先清洗。没有 IMU 时按俯视自检的约定，重力沿相机 +Z。有加速度计就用实测重力，不假设光轴朝向。
     depth = filter_depth(
@@ -107,7 +111,7 @@ def estimate_frame(
     if plane is None:
         _bump(rejects, "ground")
         return None
-    if not _ground_up_ok(plane, rotation):
+    if not _ground_up_ok(plane, rotation, initial_up):
         _bump(rejects, "world_up")
         return None
     pose = detect_visible_cube(
@@ -148,39 +152,36 @@ def estimate_frame(
     return world
 
 
-# --- 外参来源 -----------------------------------------------------------------
-# basic 固定为单位阵，表示相机就在世界原点。field 读取场地边标定的缓存，不用 AprilTag。
-
-def resolve_extrinsic(cfg: dict, mode: str) -> tuple[np.ndarray, np.ndarray]:
-    if mode == "basic":
-        return identity_extrinsic()
-    path = Path(cfg["extrinsic_path"])
-    if not path.exists():
-        raise SystemExit(f"missing extrinsic cache {path}; run with --calibrate")
-    return load_extrinsic(path)
-
-
 # --- 合成自检 -----------------------------------------------------------------
 # 不接相机。先测相机在原点的三个方块；平均分达到 4 再测三个相机点位。
 # 每个点位先对场地边求外参，再识别三个方块。
 
 def self_check(cfg: dict) -> int:
-    from geom.transform import compose_R
     from sim.scene import intrinsics_for, render_cube, render_field
 
     intr = intrinsics_for(640, 360)
     gravity = np.array([0.0, 0.0, 1.0])
     basic_trials = []
+    # 俯视 0.7 m 时方块要靠近光轴，顶面才会完整落在画面里。坐标仍大于 0.15 m，避免百分比分母被下限托住。
     targets = [
-        (np.array([0.70, 0.35, 2.0]), 0.35),
-        (np.array([-0.45, 0.50, 2.0]), -0.4),
-        (np.array([0.30, -0.55, 2.0]), 0.2),
+        (np.array([0.18, 0.16, 0.7]), 0.35),
+        (np.array([-0.20, 0.16, 0.7]), -0.4),
+        (np.array([0.16, -0.18, 0.7]), 0.2),
     ]
     rotation, translation = identity_extrinsic()
     # 基础：三个俯视方块，外参为单位阵。同一张图重复估计再取中值，模拟多帧。
     print("basic (camera frame is the world frame)")
     for center, yaw in targets:
-        color, depth = render_cube(intr, center, yaw, noise_m=0.004, seed=1, top_bgr=(255, 80, 40))
+        color, depth = render_cube(
+            intr,
+            center,
+            yaw,
+            size=float(cfg["cube_size"]),
+            ground_z=float(center[2]),
+            noise_m=0.004,
+            seed=1,
+            top_bgr=(255, 80, 40),
+        )
         samples = []
         for _ in range(int(cfg.get("min_samples", 8))):
             sample = estimate_frame(Frame(color, depth, gravity), intr, cfg, rotation, translation)
@@ -218,22 +219,25 @@ def self_check(cfg: dict) -> int:
         print("basic requirement is below 4; advanced stations are not scored")
         return 1
 
-    # 提高：三个相机位姿。每个点位先看场地边求 R、t，再识别三个方块。
+    # 提高：三个相机位姿，离方块大约 0.7 m。每个点位先看场地边求 R、t，再识别三个方块。
     print("advanced (field edges define the world frame)")
-    stations = [
-        compose_R(0.0, -0.45, 0.08),
-        compose_R(0.25, -0.4, -0.05),
-        compose_R(-0.2, -0.5, 0.1),
+    from sim.exam_scene import look_at
+
+    viewpoints = [
+        (np.array([-0.05, -0.25, 0.70]), np.array([0.40, 0.35, 0.0])),
+        (np.array([0.10, -0.40, 0.65]), np.array([0.45, 0.40, 0.0])),
+        (np.array([-0.20, -0.15, 0.75]), np.array([0.35, 0.40, 0.0])),
     ]
-    translations = [
-        np.array([0.4, 0.3, 1.6]),
-        np.array([-0.2, 0.5, 1.8]),
-        np.array([0.6, -0.2, 1.5]),
-    ]
+    stations = []
+    translations = []
+    for camera, target in viewpoints:
+        rotation, translation = look_at(camera, target)
+        stations.append(rotation)
+        translations.append(translation)
     cubes = [
-        (np.array([0.8, 0.4, 0.0]), 0.3),
-        (np.array([1.3, 0.7, 0.0]), -0.5),
-        (np.array([0.5, 0.9, 0.0]), 0.15),
+        (np.array([0.32, 0.22, 0.0]), 0.30),
+        (np.array([0.52, 0.36, 0.0]), -0.50),
+        (np.array([0.28, 0.48, 0.0]), 0.15),
     ]
     advanced = []
     for rotation, translation in zip(stations, translations):
@@ -253,7 +257,9 @@ def self_check(cfg: dict) -> int:
             continue
         est_r, est_t = pose
         for center, yaw in cubes:
-            color, depth = render_cube_in_world(intr, rotation, translation, center, yaw)
+            color, depth = render_cube_in_world(
+                intr, rotation, translation, center, yaw, size=float(cfg["cube_size"])
+            )
             sample = estimate_frame(Frame(color, depth, gravity_cam), intr, cfg, est_r, est_t)
             if sample is None:
                 advanced.append({"position_score": 0, "yaw_score": 0, "position_error": 1.0, "yaw_error": 1.0})
@@ -273,24 +279,27 @@ def self_check(cfg: dict) -> int:
     return 0 if summary["basic_passed"] else 1
 
 
-def render_cube_in_world(intr, rotation, translation, center, yaw):
+def render_cube_in_world(intr, rotation, translation, center, yaw, size: float = 0.2):
     """按给定外参把世界系方块画进相机画面，供提高要求的自检使用。"""
     from sim.scene import _face, _paint
 
     # 先铺一块世界系地面，再把方块六个面变到相机系后光栅化。相机后方的点丢掉。
     image = np.full((intr.height, intr.width, 3), 40, dtype=np.uint8)
     depth = np.full((intr.height, intr.width), np.nan, dtype=float)
-    xs = np.linspace(center[0] - 1.2, center[0] + 1.2, 70)
-    ys = np.linspace(center[1] - 1.2, center[1] + 1.2, 70)
-    gx, gy = np.meshgrid(xs, ys)
-    world = np.column_stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)])
     from geom.transform import world_to_camera
 
+    cam_center = world_to_camera(center, rotation, translation)
+    dist = max(float(cam_center[2]), 0.3)
+    step = max(dist / float(intr.fx), 0.004)
+    xs = np.arange(center[0] - 0.6, center[0] + 0.6, step)
+    ys = np.arange(center[1] - 0.6, center[1] + 0.6, step)
+    gx, gy = np.meshgrid(xs, ys)
+    world = np.column_stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)])
     ground = world_to_camera(world, rotation, translation)
     keep = ground[:, 2] > 0.2
     _paint(ground[keep], np.full((int(keep.sum()), 3), 40, dtype=np.uint8), intr, depth, image)
-    size = 0.6
     c, s = np.cos(yaw), np.sin(yaw)
+    face_samples = max(80, int(np.ceil(2.0 * size / (dist / float(intr.fx)))))
     axis_x = rotation @ np.array([c, s, 0.0]) * size
     axis_y = rotation @ np.array([-s, c, 0.0]) * size
     axis_z = rotation @ np.array([0.0, 0.0, size])
@@ -298,11 +307,11 @@ def render_cube_in_world(intr, rotation, translation, center, yaw):
     top = bottom + axis_z
     blue = (255, 80, 40)
     for pts, cols in (
-        _face(top, axis_x, axis_y, blue),
-        _face(bottom + axis_x * 0.5, axis_y, axis_z, blue),
-        _face(bottom - axis_x * 0.5, axis_y, axis_z, blue),
-        _face(bottom + axis_y * 0.5, axis_x, axis_z, blue),
-        _face(bottom - axis_y * 0.5, axis_x, axis_z, blue),
+        _face(top, axis_x, axis_y, blue, face_samples),
+        _face(bottom + axis_x * 0.5, axis_y, axis_z, blue, face_samples),
+        _face(bottom - axis_x * 0.5, axis_y, axis_z, blue, face_samples),
+        _face(bottom + axis_y * 0.5, axis_x, axis_z, blue, face_samples),
+        _face(bottom - axis_y * 0.5, axis_x, axis_z, blue, face_samples),
     ):
         facing = pts[:, 2] > 0.2
         _paint(pts[facing], cols[facing], intr, depth, image)
@@ -329,6 +338,7 @@ def _record(fused, samples: list[dict]) -> dict:
         "quality": {
             "inliers": int(np.median([s.get("inliers", 0) for s in samples])),
             "yaw_std_deg": _yaw_std_deg(samples),
+            **({"track": samples[-1]["track"]} if samples and samples[-1].get("track") else {}),
         },
     }
 
@@ -347,7 +357,9 @@ def _show_debug(color: np.ndarray, depth: np.ndarray, cfg: dict, record: dict, i
     if corners is not None:
         pixels = np.rint(project_points(corners, intr)).astype(np.int32)
         cv2.polylines(vis, [pixels], True, (255, 255, 0), 2, cv2.LINE_AA)
-    text = f"x={record['x']:.3f} y={record['y']:.3f} yaw={record['yaw']:.3f}"
+    track = record.get("quality", {}).get("track")
+    suffix = f" [{track}]" if track else ""
+    text = f"x={record['x']:.3f} y={record['y']:.3f} yaw={record['yaw']:.3f}{suffix}"
     cv2.putText(vis, text, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(vis, text, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.imshow("cube", vis)
@@ -355,13 +367,35 @@ def _show_debug(color: np.ndarray, depth: np.ndarray, cfg: dict, record: dict, i
 
 
 # --- 实机循环 -----------------------------------------------------------------
-# --calibrate 保存场地边外参。--calibrate-color 用 30 帧收紧 HSV。
+# --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
+# field 模式从起步相机跟踪：场地边能看见就校正，看不见就用视觉，视觉也失败再靠陀螺仪，超过 track_hold_s 停止输出。
 # 合格样本满 8 帧才输出 JSON。地面或外参平移跳过 30 mm 时清空缓冲。
 # 失败后 0.5 s 内重复上一结果，再失败则输出空对象。丢帧原因累加后写到标准错误。
 
+def _field_pose(color, depth, intr, cfg, gravity):
+    # 边不在画面里就返回空，调用方改走陀螺仪和视觉跟踪，不把这一帧判成标定失败。
+    plane = fit_ground(
+        sample_points(depth, intr),
+        gravity,
+        thresh=float(cfg["ground_ransac_thresh"]),
+        max_angle_deg=float(cfg["ground_max_angle_deg"]),
+        iterations=int(cfg.get("ground_ransac_iterations", 80)),
+    )
+    if plane is None:
+        return None
+    return calibrate_from_image(color, intr, plane, cfg["field_length"], cfg["field_width"])
+
+
 def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool, debug: bool) -> None:
     source = RealSenseSource(intr.width, intr.height, fps=int(cfg.get("fps", 30)))
-    rotation, translation = identity_extrinsic() if mode == "basic" else (None, None)
+    rotation, translation = identity_extrinsic()
+    tracker = None
+    if mode == "field" and not calibrate:
+        tracker = MotionTracker(
+            hold_s=float(cfg.get("track_hold_s", 0.3)),
+            vo_thresh_m=float(cfg.get("track_vo_thresh_m", 0.02)),
+            min_points=int(cfg.get("track_min_points", 12)),
+        )
     samples: list[dict] = []
     color_frames: list[tuple[np.ndarray, np.ndarray]] = []
     last_record: dict | None = None
@@ -371,6 +405,7 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
     last_translation = None
     rejects: dict[str, int] = {}
     logged_rejects = {}
+    last_tick: float | None = None
     hold_s = float(cfg.get("hold_s", 0.5))
     jump_m = float(cfg.get("jump_m", 0.03))
     min_samples = int(cfg.get("min_samples", 8))
@@ -411,10 +446,40 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
                 save_extrinsic(cfg["extrinsic_path"], pose[0], pose[1])
                 print(f"saved extrinsic to {cfg['extrinsic_path']}")
                 return
-            if rotation is None:
-                rotation, translation = resolve_extrinsic(cfg, mode)
-            sample = estimate_frame(frame, intr, cfg, rotation, translation, rejects)
             now = time.monotonic()
+            dt = 0.0 if last_tick is None else now - last_tick
+            last_tick = now
+            initial_up = None
+            if tracker is not None:
+                gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
+                up = None if frame.gravity is None else -frame.gravity
+                if not tracker.started:
+                    tracker.start(frame.color, depth, up)
+                else:
+                    tracker.begin_frame()
+                    tracker.integrate_gyro(frame.gyro or [])
+                    visual = tracker.observe_visual(frame.color, depth, intr)
+                    field_pose = _field_pose(frame.color, depth, intr, cfg, gravity)
+                    if field_pose is not None:
+                        tracker.observe_field(*field_pose)
+                        tracker.note_locked()
+                    elif visual == "ok":
+                        tracker.note_locked()
+                    else:
+                        tracker.note_lost(dt)
+                if tracker.initial_up is None and up is not None:
+                    tracker.set_initial_up(up)
+                rotation, translation = tracker.pose()
+                initial_up = tracker.initial_up
+                if not tracker.reliable:
+                    _bump(rejects, "track")
+                    sample = None
+                else:
+                    sample = estimate_frame(frame, intr, cfg, rotation, translation, rejects, initial_up)
+                    if sample is not None:
+                        sample["track"] = tracker.source
+            else:
+                sample = estimate_frame(frame, intr, cfg, rotation, translation, rejects, initial_up)
             corners = None if sample is None else sample.pop("corners_cam", None)
             origin = None if sample is None else np.asarray(sample.pop("plane_origin"), dtype=float)
             moved = False

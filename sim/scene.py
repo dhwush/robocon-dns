@@ -62,8 +62,8 @@ def render_cube(
     intr: Intrinsics,
     bottom_center: np.ndarray,
     yaw: float,
-    size: float = 0.6,
-    ground_z: float = 2.0,
+    size: float = 0.2,
+    ground_z: float = 0.7,
     top_bgr: tuple[int, int, int] = (255, 80, 40),
     front_bgr: tuple[int, int, int] | None = None,
     noise_m: float = 0.0,
@@ -73,9 +73,10 @@ def render_cube(
     """俯视：相机 +Z 指向地面，这一帧的世界系就是相机系，不用文档 2.3 的水平向前旋转。"""
     image = np.full((intr.height, intr.width, 3), 40, dtype=np.uint8)
     depth = np.full((intr.height, intr.width), np.nan, dtype=float)
-    ground = []
-    xs = np.linspace(-1.4, 1.4, 90)
-    ys = np.linspace(-1.0, 1.0, 70)
+    # 地面和方块都要铺到大约一个像素，否则近处的开运算会把有空洞的顶面抹掉，地面点也会少到让平面贴上顶面。
+    ground_step = max(float(ground_z) / float(intr.fx), 0.003)
+    xs = np.arange(-1.4, 1.4, ground_step)
+    ys = np.arange(-1.0, 1.0, ground_step)
     gx, gy = np.meshgrid(xs, ys)
     ground_pts = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, ground_z)])
     ground_col = np.full((len(ground_pts), 3), 40, dtype=np.uint8)
@@ -85,19 +86,21 @@ def render_cube(
     axis_x = np.array([c, s, 0.0]) * size
     axis_y = np.array([-s, c, 0.0]) * size
     axis_z = np.array([0.0, 0.0, -size])
+    near_z = max(float(ground_z) - float(size), 0.3)
+    face_samples = max(120, int(np.ceil(2.0 * float(size) / (near_z / float(intr.fx)))))
     center = np.asarray(bottom_center, dtype=float).copy()
     center[2] = ground_z
     top_origin = center + np.array([0.0, 0.0, -size])
     parts = []
     if faces in ("all", "top"):
-        parts.append(_face(top_origin, axis_x, axis_y, top_bgr))
+        parts.append(_face(top_origin, axis_x, axis_y, top_bgr, face_samples))
     side_color = front_bgr if front_bgr is not None else top_bgr
     if faces in ("all", "front"):
-        parts.append(_face(center + axis_x * 0.5, axis_y, axis_z, side_color))
+        parts.append(_face(center + axis_x * 0.5, axis_y, axis_z, side_color, face_samples))
     if faces == "all":
-        parts.append(_face(center - axis_x * 0.5, axis_y, axis_z, top_bgr))
-        parts.append(_face(center + axis_y * 0.5, axis_x, axis_z, top_bgr))
-        parts.append(_face(center - axis_y * 0.5, axis_x, axis_z, top_bgr))
+        parts.append(_face(center - axis_x * 0.5, axis_y, axis_z, top_bgr, face_samples))
+        parts.append(_face(center + axis_y * 0.5, axis_x, axis_z, top_bgr, face_samples))
+        parts.append(_face(center - axis_y * 0.5, axis_x, axis_z, top_bgr, face_samples))
     for pts, cols in parts:
         _paint(pts, cols, intr, depth, image)
     if noise_m > 0.0:

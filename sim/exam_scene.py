@@ -105,24 +105,30 @@ def box_polygons(
     top_bgr: tuple[int, int, int],
     front_bgr: tuple[int, int, int] | None = None,
     z_sign: float = 1.0,
+    lower_bgr: tuple[int, int, int] | None = None,
 ) -> list[tuple[np.ndarray, tuple[int, int, int]]]:
-    """Five faces. The front face is the +local-X side. z_sign > 0 points up."""
+    """顶面和四个侧面。给出 lower_bgr 时，侧面分成上、下两截纯色。z_sign > 0 朝上。"""
     c, s = np.cos(yaw), np.sin(yaw)
     axis_x = np.array([c, s, 0.0]) * size
     axis_y = np.array([-s, c, 0.0]) * size
     axis_z = np.array([0.0, 0.0, z_sign * height])
     base = np.asarray(bottom, dtype=float)
-    side = front_bgr if front_bgr is not None else top_bgr
     half_x = axis_x * 0.5
     half_y = axis_y * 0.5
     half_z = axis_z * 0.5
-    faces = [
-        (_quad(base + half_z, half_x, half_y), top_bgr),
-        (_quad(base + half_x + half_z, half_y, half_z), side),
-        (_quad(base - half_x + half_z, half_y, half_z), top_bgr),
-        (_quad(base + half_y + half_z, half_x, half_z), top_bgr),
-        (_quad(base - half_y + half_z, half_x, half_z), top_bgr),
-    ]
+    faces = [(_quad(base + half_z, half_x, half_y), top_bgr)]
+    horizontals = (half_x, half_y, -half_x, -half_y)
+    spans = (half_y, half_x, half_y, half_x)
+    if lower_bgr is None:
+        # 没有下半色时，四个侧面跟顶面同色。给出 front_bgr 时只把 +X 侧面换成该色。
+        for shift, span in zip(horizontals, spans):
+            color = front_bgr if front_bgr is not None and shift is half_x else top_bgr
+            faces.append((_quad(base + shift + half_z, span, half_z), color))
+        return faces
+    quarter = half_z * 0.5
+    for shift, span in zip(horizontals, spans):
+        faces.append((_quad(base + shift + half_z + quarter, span, quarter), top_bgr))
+        faces.append((_quad(base + shift + quarter, span, quarter), lower_bgr))
     return faces
 
 
@@ -221,6 +227,7 @@ def render_nadir(
             item["top"],
             item.get("front"),
             z_sign=-1.0,
+            lower_bgr=item.get("lower"),
         ):
             paint_polygon(color, depth, poly, bgr, intr)
     add_depth_noise(depth, noise_m, 0.01, seed)
@@ -269,6 +276,7 @@ def _paint_box(color, depth, intr, rotation, translation, item: dict, z_sign: fl
         item["top"],
         item.get("front"),
         z_sign=z_sign,
+        lower_bgr=item.get("lower"),
     ):
         paint_polygon(color, depth, world_to_camera(poly, rotation, translation), bgr, intr)
 

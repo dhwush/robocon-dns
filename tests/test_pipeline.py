@@ -40,13 +40,22 @@ def test_ground_rejects_tilted_normal():
 
 
 def test_visible_cube_pose_within_tolerance():
-    """俯视渲染一个带 4 mm 深度噪声的 0.6 m 方块。可见面检测的底面中心误差要小于 3 cm，
+    """俯视 0.7 m 渲染一个带 4 mm 深度噪声的 0.2 m 方块。可见面检测的底面中心误差要小于 3 cm，
     yaw 按 90° 对称折返后与真值相差小于 3°。"""
     intr = intrinsics_for(320, 240)
-    center = np.array([0.70, 0.35, 2.0])
+    center = np.array([0.08, 0.06, 0.7])
     yaw = 0.35
-    color, depth = render_cube(intr, center, yaw, noise_m=0.004, seed=2, top_bgr=(255, 80, 40))
     cfg = load_config("config/default.yaml")
+    color, depth = render_cube(
+        intr,
+        center,
+        yaw,
+        size=float(cfg["cube_size"]),
+        ground_z=float(center[2]),
+        noise_m=0.004,
+        seed=2,
+        top_bgr=(255, 80, 40),
+    )
     depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
     from ground.plane import sample_points
 
@@ -58,10 +67,10 @@ def test_visible_cube_pose_within_tolerance():
         intr,
         plane,
         cfg["colors"],
-        cube_size=0.6,
+        cube_size=float(cfg["cube_size"]),
         min_pixels=200,
         min_footprint_fraction=0.35,
-        size_tolerance=0.2,
+        size_tolerance=float(cfg["size_tolerance"]),
     )
     assert pose is not None
     assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.03
@@ -124,8 +133,8 @@ def test_face_fallback_on_single_face():
     intr = intrinsics_for(320, 240)
     cfg = load_config("config/default.yaml")
     rotation = compose_R(0.15, -0.7, 0.0)
-    translation = np.array([0.2, 0.1, 1.5])
-    center = np.array([0.4, 0.3, 0.0])
+    translation = np.array([0.12, 0.05, 0.7])
+    center = np.array([0.22, 0.12, 0.0])
     yaw = 0.25
     color, depth = _render_front_face(intr, rotation, translation, center, yaw)
     gravity = rotation @ np.array([0.0, 0.0, -1.0])
@@ -137,7 +146,16 @@ def test_face_fallback_on_single_face():
     depth_f = filter_depth(depth, 0.3, 3.0, 0.08)
     plane = fit_ground(sample_points(depth_f, intr, stride=2), gravity)
     assert plane is not None
-    pose = fit_when_face_missing(color, depth_f, intr, plane, cfg["colors"], cube_size=0.6, rotation=rotation, translation=translation)
+    pose = fit_when_face_missing(
+        color,
+        depth_f,
+        intr,
+        plane,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        rotation=rotation,
+        translation=translation,
+    )
     assert pose is not None
     from geom.transform import camera_to_world
 
@@ -159,7 +177,7 @@ def _render_front_face(intr, rotation, translation, center, yaw):
     ground = world_to_camera(ground_w, rotation, translation)
     keep = ground[:, 2] > 0.2
     _paint(ground[keep], np.full((int(keep.sum()), 3), 40, np.uint8), intr, depth, image)
-    size = 0.6
+    size = 0.2
     c, s = np.cos(yaw), np.sin(yaw)
     axis_x = rotation @ np.array([c, s, 0.0]) * size
     axis_y = rotation @ np.array([-s, c, 0.0]) * size

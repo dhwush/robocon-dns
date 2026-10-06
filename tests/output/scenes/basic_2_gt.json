@@ -3,6 +3,6 @@
   "y": 0.05,
   "z": 1.45,
   "yaw": -2.84,
-  "marked": true,
-  "size": 0.6
+  "marked": false,
+  "size": 0.2
 }

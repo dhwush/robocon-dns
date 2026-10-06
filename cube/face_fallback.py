@@ -38,7 +38,7 @@ def fit_when_face_missing(
     intr,
     plane: Plane,
     colors: list[dict],
-    cube_size: float = 0.6,
+    cube_size: float = 0.2,
     rotation: np.ndarray | None = None,
     translation: np.ndarray | None = None,
 ) -> CubePose | None:
@@ -96,7 +96,7 @@ def fit_when_face_missing(
                 # 贴合时用几何中心量点到盒子的距离。返回的仍是底面中心，半高由入口统一加。
                 center = bottom + up * half
                 dist = _box_distance(points, center, edge, np.cross(up, edge), up, cube_size)
-                # 4 cm 内算贴住。比例太低说明这不是一个 0.6 m 的贴地方块。
+                # 4 cm 内算贴住。比例太低说明这不是当前边长的贴地方块。
                 score = float((dist < 0.04).mean())
                 if score > best_score:
                     best_score = score

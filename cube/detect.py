@@ -32,7 +32,7 @@ class CubePose:
 
 # --- 颜色分割 -----------------------------------------------------------------
 # 开运算去掉孤立色点，闭运算补小洞。红色在色相环两端，配置里写成两段再并起来。
-# front 掩膜只包含被标成正面的颜色，用来去掉 90° 歧义。
+# 实机方块上半纯红、下半纯蓝，两色并进同一块掩膜。水平分界绕四周，不标成正面，yaw 仍按 90° 对称。
 
 def color_mask(color_bgr: np.ndarray, colors: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
@@ -227,7 +227,7 @@ def _mask_points(color_bgr, depth, intr, colors, zmin: float, zmax: float):
 # 长边、短边、面积三道门限仍然把不合格的足迹丢掉。
 
 def _footprint(points: np.ndarray, plane: Plane) -> tuple[np.ndarray, np.ndarray, tuple]:
-    # 投影到地面后，顶面仍是约 0.6 m 的正方形；只看见一个竖直面时会塌成一条窄带。
+    # 投影到地面后，顶面仍是约 0.2 m 的正方形；只看见一个竖直面时会塌成一条窄带。
     projected = plane.project(points)
     axis_x, axis_y = plane.basis()
     origin = plane.origin()
@@ -248,10 +248,10 @@ def detect_visible_cube(
     intr,
     plane: Plane,
     colors: list[dict],
-    cube_size: float = 0.6,
+    cube_size: float = 0.2,
     min_pixels: int = 400,
     min_footprint_fraction: float = 0.45,
-    size_tolerance: float = 0.18,
+    size_tolerance: float = 0.06,
     rotation: np.ndarray | None = None,
     translation: np.ndarray | None = None,
     zmin: float = 0.3,
@@ -282,7 +282,7 @@ def detect_visible_cube(
     peak = float(np.percentile(plane.signed_distance(points), 90))
     if abs(peak - cube_size) > size_tolerance + 0.05 and peak < cube_size * 0.5:
         return fail("height")
-    # 2. 足迹要接近 0.6 m × 0.6 m。太扁说明只剩一条棱，这一帧拒绝。
+    # 2. 足迹要接近 0.2 m × 0.2 m。太扁说明只剩一条棱，这一帧拒绝。
     coords, _projected, rect = _footprint(points, plane)
     (center_u, center_v), (width, height_rect), angle_deg = rect
     long_side = max(width, height_rect)

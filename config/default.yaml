@@ -1,5 +1,5 @@
 mode: basic
-cube_size: 0.6
+cube_size: 0.2
 field_length: 2.0
 field_width: 1.2
 depth_min: 0.3
@@ -12,7 +12,9 @@ ground_max_angle_deg: 8.0
 min_face_pixels: 400
 # 足迹面积低于这个比例就丢帧。长边另有 12% 相对上限，短边短于 0.45 倍边长也丢帧。
 min_footprint_fraction: 0.45
-size_tolerance: 0.18
+# 长边门限是 min(这个值, 0.12 * cube_size)。0.06 m 仍大于 0.2 m 的 12%，长边继续按 12% 丢帧；
+# 高度检查用的是这个值再加 5 cm，不能再留 0.18 m，否则比边长还宽。
+size_tolerance: 0.06
 frames_to_fuse: 15
 min_samples: 8
 output_hz: 10
@@ -22,22 +24,23 @@ fps: 30
 hsv_calib_frames: 30
 hsv_path: config/hsv.yaml
 extrinsic_path: config/extrinsic.yaml
+# 提高要求：场地边丢失后，视觉或陀螺还能维持这么久；再久就停止输出，直到重新锁定。
+track_hold_s: 0.3
+track_vo_thresh_m: 0.02
+track_min_points: 12
 # 基本要求不调用掠射补救。补救不是顶面拟合，打开后也只在可见面检测拒绝时才跑。
 enable_face_fallback: false
+# 方块上半纯红、下半纯蓝，分界绕四周，不是某一面的朝向标记。两色都进掩膜，都不标 front。
 colors:
   - name: red
     hsv_low: [0, 80, 60]
     hsv_high: [10, 255, 255]
-    front: true
+    front: false
   - name: red_high
     hsv_low: [170, 80, 60]
     hsv_high: [180, 255, 255]
-    front: true
+    front: false
   - name: blue
     hsv_low: [100, 80, 60]
     hsv_high: [130, 255, 255]
-    front: false
-  - name: yellow
-    hsv_low: [20, 80, 60]
-    hsv_high: [35, 255, 255]
     front: false

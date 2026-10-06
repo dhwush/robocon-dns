@@ -21,7 +21,6 @@ from sim.exam_scene import (
     SCENE_DIR,
     VIS_DIR,
     WHITE_BGR,
-    YELLOW_BGR,
     look_at,
     load_rgbd,
     render_field,
@@ -31,13 +30,14 @@ from sim.exam_scene import (
 
 FIELD_LENGTH = 2.0
 FIELD_WIDTH = 1.2
-CUBE = 0.6
+CUBE = 0.2
 
 
 # --- 场景描述 -----------------------------------------------------------------
 # 基础要求：俯视、三个方块。提高要求：三个相机点位，每点三个方块。
 
-def _cube(x, y, yaw, top, front=None, z=0.0):
+def _cube(x, y, yaw, z=0.0):
+    # 上半纯红、下半纯蓝，没有正面标记，yaw 按 90° 对称评分。
     return {
         "x": x,
         "y": y,
@@ -45,9 +45,10 @@ def _cube(x, y, yaw, top, front=None, z=0.0):
         "yaw": yaw,
         "size": CUBE,
         "height": CUBE,
-        "top": top,
-        "front": front,
-        "marked": front is not None,
+        "top": RED_BGR,
+        "lower": BLUE_BGR,
+        "front": None,
+        "marked": False,
     }
 
 
@@ -76,9 +77,9 @@ def basic_cases() -> list[dict]:
         _distractor(-0.10, 0.42, -0.15, WHITE_BGR, 0.28, 0.04, near_z),
     ]
     specs = [
-        (_cube(0.42, 0.12, 0.22, BLUE_BGR, z=far_z), far_distractors, far_z),
-        (_cube(-0.36, 0.16, -0.30, YELLOW_BGR, z=far_z), far_distractors, far_z),
-        (_cube(0.55, 0.05, -2.84, BLUE_BGR, RED_BGR, z=near_z), near_distractors, near_z),
+        (_cube(0.42, 0.12, 0.22, z=far_z), far_distractors, far_z),
+        (_cube(-0.36, 0.16, -0.30, z=far_z), far_distractors, far_z),
+        (_cube(0.55, 0.05, -2.84, z=near_z), near_distractors, near_z),
     ]
     return [
         {
@@ -94,9 +95,9 @@ def basic_cases() -> list[dict]:
 
 def advanced_stations() -> list[dict]:
     cubes = [
-        _cube(0.72, 0.50, 0.22, BLUE_BGR),
-        _cube(0.78, 0.86, -0.18, YELLOW_BGR),
-        _cube(1.20, 0.52, -2.45, BLUE_BGR, RED_BGR),
+        _cube(0.72, 0.50, 0.22),
+        _cube(0.78, 0.86, -0.18),
+        _cube(1.20, 0.52, -2.45),
     ]
     distractors = [
         _distractor(1.62, 0.96, 0.5, GREEN_BGR, 0.22, 0.24),
