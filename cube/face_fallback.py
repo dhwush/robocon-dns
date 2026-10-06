@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from cube.detect import CubePose, color_mask
+from cube.detect import GROUND_CLEARANCE_M, CubePose, color_mask
 from geom.transform import deproject_pixels, fold_yaw_quarter, yaw_about_z
 from ground.plane import Plane
 
@@ -54,8 +54,8 @@ def fit_when_face_missing(
         return None
     points = deproject_pixels(np.column_stack([xs[good], ys[good]]), z[good], intr)
     height = plane.signed_distance(points)
-    # 比基本检测略宽：掠射时深度更吵，但仍丢掉明显钻到地下或高过方块的点。
-    keep = (height > -0.08) & (height < cube_size + 0.1)
+    # 比基本检测略宽：掠射时深度更吵。贴地一条仍丢掉，避免红蓝地面把竖直面拟合拉偏。
+    keep = (height > GROUND_CLEARANCE_M) & (height < cube_size + 0.1)
     if int(keep.sum()) < 30:
         return None
     points = points[keep]

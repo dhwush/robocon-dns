@@ -87,7 +87,7 @@ def test_config_intrinsics_are_the_only_source():
     intr = load_intrinsics("config/intrinsics.yaml")
     assert intr.distortion_model == "inverse_brown_conrady"
     assert intr.width == 1280
-    assert abs(intr.fx - 674.4192801798159) < 1e-9
+    assert abs(intr.fx - 909.7513) < 1e-9
     point = np.array([0.2, -0.1, 1.5])
     pixel = project_points(point, intr)[0]
     back = deproject_pixels(pixel, np.array([point[2]]), intr)[0]

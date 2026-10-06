@@ -147,6 +147,7 @@ class RealSenseSource:
         self._event = threading.Event()
         self._pending: tuple | None = None
         self._gyro: deque = deque(maxlen=400)
+        self._accel: np.ndarray | None = None
         self._gyro_to_color = np.eye(3)
         self._accel_to_color = np.eye(3)
         self._gyro_ready = False
@@ -194,6 +195,14 @@ class RealSenseSource:
         except Exception:
             return np.eye(3)
 
+    def _gravity_from_specific(self, specific: np.ndarray) -> np.ndarray | None:
+        # 加速度计静止时指向“上”。旋到彩色系后取反，得到相机系里的重力方向。
+        up = self._accel_to_color @ specific
+        norm = np.linalg.norm(up)
+        if norm <= 1.0:
+            return None
+        return -up / norm
+
     def _on_frame(self, frame) -> None:
         # 回调里把彩色帧和陀螺样品拆开。图像速率约 30 Hz，陀螺约 200 Hz，不能只留每个图像帧上的一颗陀螺。
         rs = self._rs
@@ -211,14 +220,16 @@ class RealSenseSource:
             depth = np.asanyarray(filtered.get_data()).astype(float) * self.depth_scale
             color = np.asanyarray(color_frame.get_data()).copy()
             gravity = None
+            # 对齐结果经常不带加速度。空帧对象不是 None，直接读会抛掉整帧彩色和深度。
             accel = aligned.first_or_default(rs.stream.accel)
-            if accel is not None:
+            if accel:
                 data = accel.as_motion_frame().get_motion_data()
                 specific = np.array([data.x, data.y, data.z], dtype=float)
-                up = self._accel_to_color @ specific
-                norm = np.linalg.norm(up)
-                if norm > 1.0:
-                    gravity = -up / norm
+                gravity = self._gravity_from_specific(specific)
+            if gravity is None:
+                with self._lock:
+                    if self._accel is not None:
+                        gravity = self._accel.copy()
             with self._lock:
                 gyro = list(self._gyro)
                 self._gyro.clear()
@@ -228,10 +239,18 @@ class RealSenseSource:
         if not self._gyro_ready or not frame.is_motion_frame():
             return
         motion = frame.as_motion_frame()
-        if motion.profile.stream_type() != rs.stream.gyro:
-            return
+        kind = motion.profile.stream_type()
         data = motion.get_motion_data()
-        omega = self._gyro_to_color @ np.array([data.x, data.y, data.z], dtype=float)
+        sample = np.array([data.x, data.y, data.z], dtype=float)
+        if kind == rs.stream.accel:
+            gravity = self._gravity_from_specific(sample)
+            if gravity is not None:
+                with self._lock:
+                    self._accel = gravity
+            return
+        if kind != rs.stream.gyro:
+            return
+        omega = self._gyro_to_color @ sample
         with self._lock:
             self._gyro.append((float(motion.timestamp) * 1e-3, omega))
 

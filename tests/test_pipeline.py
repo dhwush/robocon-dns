@@ -77,6 +77,49 @@ def test_visible_cube_pose_within_tolerance():
     assert abs(fold_yaw_quarter(pose.yaw - yaw)) < np.deg2rad(3.0)
 
 
+def test_dim_cube_on_red_and_blue_ground():
+    """地面半边暗红、半边暗蓝，方块本身也偏暗。底面中心仍要落在方块上，不能铺到地面。"""
+    intr = intrinsics_for(320, 240)
+    center = np.array([0.08, 0.06, 0.7])
+    yaw = 0.35
+    cfg = load_config("config/default.yaml")
+    color, depth = render_cube(
+        intr,
+        center,
+        yaw,
+        size=float(cfg["cube_size"]),
+        ground_z=float(center[2]),
+        noise_m=0.004,
+        seed=2,
+        top_bgr=(255, 80, 40),
+    )
+    cube = np.any(color != 40, axis=2)
+    ground = ~cube
+    color[ground] = (90, 40, 30)
+    right = ground.copy()
+    right[:, : intr.width // 2] = False
+    color[right] = (30, 25, 55)
+    color[cube] = (30, 25, 55)
+    depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
+    from ground.plane import sample_points
+
+    plane = fit_ground(sample_points(depth_f, intr, stride=3), np.array([0.0, 0.0, 1.0]))
+    assert plane is not None
+    pose = detect_visible_cube(
+        color,
+        depth_f,
+        intr,
+        plane,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        min_pixels=200,
+        min_footprint_fraction=0.35,
+        size_tolerance=float(cfg["size_tolerance"]),
+    )
+    assert pose is not None
+    assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.04
+
+
 def test_field_corner_recovers_extrinsic(tmp_path):
     """已知外参下，原点出发的长边 2 m 和短边 1.2 m 应解回同一组 R、t。
     写入 yaml 再读回，数值不变。"""
