@@ -40,27 +40,25 @@ def clip_range(depth: np.ndarray, zmin: float, zmax: float) -> np.ndarray:
 def remove_flying_pixels(depth: np.ndarray, thresh_m: float) -> np.ndarray:
     # 飞点出现在深度不连续的边缘：一个像素跳到前景或背景。
     # 看 3×3 邻域的最大深度差，超过阈值就丢掉该像素。邻域有效点少于 3 个时不判，避免把稀疏点误删。
-    out = np.array(depth, dtype=float, copy=True)
-    local_max = np.full(out.shape, -np.inf)
-    local_min = np.full(out.shape, np.inf)
-    count = np.zeros(out.shape, dtype=int)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            shifted = np.roll(np.roll(out, dy, axis=0), dx, axis=1)
-            # roll 会把对面一行卷过来，卷进来的边必须作废。
-            if dy > 0:
-                shifted[:dy, :] = np.nan
-            elif dy < 0:
-                shifted[dy:, :] = np.nan
-            if dx > 0:
-                shifted[:, :dx] = np.nan
-            elif dx < 0:
-                shifted[:, dx:] = np.nan
-            ok = np.isfinite(shifted)
-            local_max = np.where(ok, np.maximum(local_max, shifted), local_max)
-            local_min = np.where(ok, np.minimum(local_min, shifted), local_min)
-            count += ok
+    # 膨胀和腐蚀一次扫完整幅图，不再对每个邻域各拷贝一次。
+    import cv2
+
+    src = np.asarray(depth, dtype=np.float32)
+    finite = np.isfinite(src)
+    count = cv2.boxFilter(
+        finite.astype(np.float32),
+        -1,
+        (3, 3),
+        normalize=False,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    hi = np.where(finite, src, np.float32(-1.0e6))
+    lo = np.where(finite, src, np.float32(1.0e6))
+    kernel = np.ones((3, 3), np.uint8)
+    local_max = cv2.dilate(hi, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=-1.0e6)
+    local_min = cv2.erode(lo, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=1.0e6)
     jump = ((local_max - local_min) > thresh_m) & (count >= 3)
+    out = np.array(depth, dtype=float, copy=True)
     out[jump] = np.nan
     return out
 

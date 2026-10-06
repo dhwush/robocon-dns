@@ -210,10 +210,22 @@ def _drop_edge_jumps(depth: np.ndarray, mask: np.ndarray, thresh_m: float = 0.01
     """轮廓附近深度跳变超过 15 mm 的点从掩膜去掉。整幅图的 80 mm 飞点过滤在这之前已经做过。"""
     from camera.source import remove_flying_pixels
 
-    local = np.where(mask > 0, depth, np.nan)
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return mask
+    # 只在掩膜外接框里看邻域。框外的深度本来就不会拿来比较。
+    y0 = max(int(ys.min()) - 1, 0)
+    y1 = min(int(ys.max()) + 2, mask.shape[0])
+    x0 = max(int(xs.min()) - 1, 0)
+    x1 = min(int(xs.max()) + 2, mask.shape[1])
+    sub = mask[y0:y1, x0:x1]
+    local = np.where(sub > 0, depth[y0:y1, x0:x1], np.nan)
     cleaned = remove_flying_pixels(local, thresh_m)
+    updated = sub.copy()
+    on = sub > 0
+    updated[on] = np.where(np.isfinite(cleaned[on]), 255, 0).astype(np.uint8)
     kept = mask.copy()
-    kept[mask > 0] = np.where(np.isfinite(cleaned[mask > 0]), 255, 0).astype(np.uint8)
+    kept[y0:y1, x0:x1] = updated
     return kept
 
 
@@ -327,17 +339,28 @@ def calibrate_hsv(
 # --- 掩膜反投影 ---------------------------------------------------------------
 # 只用腐蚀后仍有深度的彩色像素，按已知内参变到相机系。
 
-def _mask_points(color_bgr, depth, intr, colors, zmin: float, zmax: float, plane: Plane, cube_size: float):
-    prepared = prepare_mask(
-        color_bgr,
-        depth,
-        colors,
-        zmin,
-        zmax,
-        plane=plane,
-        intr=intr,
-        cube_size=cube_size,
-    )
+def _mask_points(
+    color_bgr,
+    depth,
+    intr,
+    colors,
+    zmin: float,
+    zmax: float,
+    plane: Plane,
+    cube_size: float,
+    prepared=None,
+):
+    if prepared is None:
+        prepared = prepare_mask(
+            color_bgr,
+            depth,
+            colors,
+            zmin,
+            zmax,
+            plane=plane,
+            intr=intr,
+            cube_size=cube_size,
+        )
     if prepared is None:
         return None
     mask, front = prepared
@@ -388,6 +411,7 @@ def detect_visible_cube(
     zmin: float = 0.3,
     zmax: float = 3.0,
     rejects: dict | None = None,
+    prepared=None,
 ) -> CubePose | None:
     # 颜色足迹给出底面中心和 yaw。面积、长边或短边不合格就丢帧，不拟合上表面。
     def fail(reason: str) -> None:
@@ -398,7 +422,9 @@ def detect_visible_cube(
 
     # 1. 颜色点是否够多，并且贴在地面以上、高度接近方块边长。
     # 地面投影要用可见的侧面和顶面一起收成足迹，不用“离地 0.4h 再拟合顶面”那一步。
-    packed = _mask_points(color_bgr, depth, intr, colors, zmin, zmax, plane, cube_size)
+    packed = _mask_points(
+        color_bgr, depth, intr, colors, zmin, zmax, plane, cube_size, prepared=prepared
+    )
     if packed is None:
         return fail("mask")
     points, front_flag, count, _mask = packed

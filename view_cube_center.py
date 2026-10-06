@@ -55,6 +55,7 @@ def main() -> None:
     source = RealSenseSource(intr.width, intr.height, fps=int(cfg.get("fps", 30)))
     height = float(cfg["cube_size"])
     last = time.monotonic()
+    fps = 0.0
     try:
         while True:
             frame = source.read()
@@ -85,12 +86,11 @@ def main() -> None:
                 mask_view = prepared[0]
                 contours, _ = cv2.findContours(mask_view, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(vis, contours, -1, (0, 255, 0), 2)
-            now = time.monotonic()
-            fps = 1.0 / max(now - last, 1e-3)
-            last = now
             lines = [f"{fps:.0f} fps"]
             if plane is None:
                 lines.append("no ground")
+            elif prepared is None:
+                lines.append("no cube (mask)")
             else:
                 rejects: dict[str, int] = {}
                 pose = detect_visible_cube(
@@ -106,6 +106,7 @@ def main() -> None:
                     zmin=float(cfg["depth_min"]),
                     zmax=float(cfg["depth_max"]),
                     rejects=rejects,
+                    prepared=prepared,
                 )
                 if pose is None or pose.corners is None:
                     reason = next(iter(rejects), "miss")
@@ -130,12 +131,18 @@ def main() -> None:
                     lines.append(f"floor x={bottom[0]:+.3f}  y={bottom[1]:+.3f}  z={bottom[2]:+.3f} m")
                     lines.append(f"inliers={pose.inliers}  footprint={pose.footprint_fraction:.2f}")
             _label(vis, lines)
-            mask_bgr = cv2.cvtColor(mask_view, cv2.COLOR_GRAY2BGR)
-            preview = np.hstack([vis, mask_bgr])
-            scale = 1280 / preview.shape[1]
-            if scale < 1.0:
-                preview = cv2.resize(preview, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            # 先缩小再并排，避免每帧拼一张 2560 宽的图再缩回去。
+            half = (vis.shape[1] // 2, vis.shape[0] // 2)
+            preview = np.hstack(
+                [
+                    cv2.resize(vis, half, interpolation=cv2.INTER_AREA),
+                    cv2.cvtColor(cv2.resize(mask_view, half, interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR),
+                ]
+            )
             cv2.imshow("cube center", preview)
+            now = time.monotonic()
+            fps = 1.0 / max(now - last, 1e-3)
+            last = now
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
