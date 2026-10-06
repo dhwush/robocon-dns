@@ -52,6 +52,7 @@ def color_mask(color_bgr: np.ndarray, colors: list[dict]) -> tuple[np.ndarray, n
 
 
 def _valid_depth(depth: np.ndarray, zmin: float, zmax: float) -> np.ndarray:
+    # 工作距离内的有限深度才参与选块。NaN 和超距点不能拿来判断这块是不是方块。
     return np.isfinite(depth) & (depth >= zmin) & (depth <= zmax)
 
 
@@ -116,6 +117,7 @@ def prepare_mask(
     zmin: float = 0.3,
     zmax: float = 3.0,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    # 先收成一块轮廓，再按距离腐蚀，并丢掉轮廓附近 15 mm 以上的深度跳变。
     mask, front = color_mask(color_bgr, colors)
     selected = _select_component(mask, front, depth, zmin, zmax)
     if selected is None:
@@ -139,6 +141,7 @@ def prepare_mask(
 
 
 def _circular_median_hue(hues: np.ndarray) -> float:
+    # OpenCV 色相是 0–180 的环。取环形中值，避免 0 和 179 被当成差很远。
     values = np.asarray(hues, dtype=float)
     if len(values) > 2000:
         values = values[:: max(len(values) // 2000, 1)]
@@ -258,7 +261,9 @@ def detect_visible_cube(
     zmax: float = 3.0,
     rejects: dict | None = None,
 ) -> CubePose | None:
+    # 颜色足迹给出底面中心和 yaw。面积、长边或短边不合格就丢帧，不拟合上表面。
     def fail(reason: str) -> None:
+        # 记一次拒绝原因。返回值是 None，调用方据此丢掉这一帧。
         if rejects is not None:
             rejects[reason] = int(rejects.get(reason, 0)) + 1
         return None

@@ -91,6 +91,7 @@ def fit_ground(
     iterations: int = 200,
     seed: int = 0,
 ) -> Plane | None:
+    # 近似水平的候选里取最低一层。方块顶面和地面都水平，取最低的才不会把顶面当成地面。
     pts = np.asarray(points, dtype=float)
     if len(pts) < 3:
         return None

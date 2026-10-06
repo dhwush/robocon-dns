@@ -18,6 +18,7 @@ from geom.transform import deproject_pixels
 
 
 def _skew(vector: np.ndarray) -> np.ndarray:
+    # 反对称矩阵。旋转向量的指数映射要用它把轴写成叉乘。
     x, y, z = np.asarray(vector, dtype=float)
     return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=float)
 
@@ -33,6 +34,7 @@ def _so3_exp(rotation_vector: np.ndarray) -> np.ndarray:
 
 
 def _rotation_error(rotation: np.ndarray) -> float:
+    # 相对单位阵的转角。接近 0 说明这一步陀螺几乎没转，不必改写位姿。
     cosine = float(np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0))
     return float(np.arccos(cosine))
 
@@ -101,6 +103,7 @@ class MotionTracker:
     """起步相机系下的外参。reliable 为假时调用方应停止输出，避免把跟丢后的冻结平移当成新位置。"""
 
     def __init__(self, hold_s: float = 0.3, vo_thresh_m: float = 0.02, min_points: int = 12):
+        # 起步外参是单位旋转和零平移。hold_s 是跟丢后仍允许输出的时间。
         self.hold_s = float(hold_s)
         self.vo_thresh_m = float(vo_thresh_m)
         self.min_points = int(min_points)
@@ -121,6 +124,7 @@ class MotionTracker:
         self._last_gyro_stamp: float | None = None
 
     def pose(self) -> tuple[np.ndarray, np.ndarray]:
+        # 返回副本，避免调用方改到跟踪器内部的 R、t。
         return self.rotation.copy(), self.translation.copy()
 
     def set_initial_up(self, up_camera: np.ndarray) -> None:
@@ -146,6 +150,7 @@ class MotionTracker:
             self.set_initial_up(up_camera)
 
     def begin_frame(self) -> None:
+        # 陀螺和视觉都相对这一帧开始时的位姿积分，所以要先记下当前值。
         self._rotation_prev = self.rotation.copy()
         self._translation_prev = self.translation.copy()
 
@@ -207,19 +212,23 @@ class MotionTracker:
         self.source = "field"
 
     def note_locked(self) -> None:
+        # 视觉或场地边成功时清掉跟丢计时，输出可以继续。
         self.lost_s = 0.0
         self.reliable = True
 
     def note_lost(self, dt: float) -> None:
+        # 累计跟丢时间。超过 hold_s 后 reliable 变假，调用方应停止输出。
         self.lost_s += max(float(dt), 0.0)
         self.reliable = self.lost_s <= self.hold_s
 
     def _remember(self, color_bgr: np.ndarray, depth: np.ndarray) -> None:
+        # 留下灰度和深度，下一帧光流和反投影都相对这一帧。
         gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY) if color_bgr.ndim == 3 else np.asarray(color_bgr)
         self._prev_gray = gray
         self._prev_depth = np.asarray(depth, dtype=np.float32)
 
     def _visual_motion(self, color_bgr: np.ndarray, depth: np.ndarray, intr) -> tuple[np.ndarray, np.ndarray] | None:
+        # 光流跟上特征后再配深度求刚体增量。点不够或对齐失败就返回空，朝向留给陀螺仪。
         gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY) if color_bgr.ndim == 3 else np.asarray(color_bgr)
         features = cv2.goodFeaturesToTrack(self._prev_gray, maxCorners=120, qualityLevel=0.01, minDistance=16)
         if features is None or len(features) < self.min_points:
@@ -243,6 +252,7 @@ class MotionTracker:
         return align_points(src, dst, thresh_m=self.vo_thresh_m, min_points=self.min_points)
 
     def _pair_points(self, previous_px, previous_depth, current_px, current_depth, intr):
+        # 只保留两帧都有有效深度的特征，并反投影成相机系点对。
         src_px = []
         src_z = []
         dst_px = []

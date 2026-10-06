@@ -80,6 +80,7 @@ def test_visual_shift_of_a_textured_plane():
     texture = rng.integers(0, 255, size=(50, 50), dtype=np.uint8)
 
     def frame(shift: int):
+        # 纹理块平移 shift 个像素，深度固定 1 m，用来把像素位移换算成相机平移。
         color = np.zeros((120, 160), dtype=np.uint8)
         depth = np.full((120, 160), np.nan)
         color[30:80, 40 + shift : 90 + shift] = texture

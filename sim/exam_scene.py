@@ -51,6 +51,7 @@ def clip_near(poly: np.ndarray, zmin: float = 0.25) -> np.ndarray:
 
 
 def _cross_z(start: np.ndarray, end: np.ndarray, zmin: float) -> np.ndarray:
+    # 线段与近裁剪平面 z = zmin 的交点。两端深度差接近 0 时停在起点，避免除零。
     delta = end[2] - start[2]
     scale = 0.0 if abs(delta) < 1e-9 else (zmin - start[2]) / delta
     return start + scale * (end - start)
@@ -63,6 +64,7 @@ def paint_polygon(
     bgr: tuple[int, int, int],
     intr,
 ) -> None:
+    # 凸多边形先裁到相机前方，再按射线与平面的交点写深度。更近的像素覆盖更远的。
     poly = clip_near(poly_cam)
     if len(poly) < 3 or np.any(poly[:, 2] <= 0.05):
         return
@@ -87,6 +89,7 @@ def paint_polygon(
 
 
 def _quad(origin: np.ndarray, axis_a: np.ndarray, axis_b: np.ndarray) -> np.ndarray:
+    # origin 是中心，axis_a 和 axis_b 是半轴，四个顶点按顺序围成凸四边形。
     return np.vstack(
         [
             origin - axis_a - axis_b,
@@ -142,6 +145,7 @@ def blank(intr) -> tuple[np.ndarray, np.ndarray]:
 
 
 def add_depth_noise(depth: np.ndarray, noise_m: float, hole_fraction: float, seed: int) -> None:
+    # 只扰动已有深度。空洞写成 NaN，模拟 D435i 的散粒噪声和边缘丢点。
     if noise_m <= 0.0 and hole_fraction <= 0.0:
         return
     rng = np.random.default_rng(seed)
@@ -154,6 +158,7 @@ def add_depth_noise(depth: np.ndarray, noise_m: float, hole_fraction: float, see
 
 
 def draw_polyline(color: np.ndarray, intr, points_cam: np.ndarray, bgr: tuple[int, int, int], thickness: int) -> None:
+    # 地面折线投影到彩色图。穿到相机后方的段先裁掉，避免投影除以负深度。
     count = len(points_cam)
     for index in range(count):
         segment = _clip_edge(points_cam[index], points_cam[(index + 1) % count])
@@ -164,6 +169,7 @@ def draw_polyline(color: np.ndarray, intr, points_cam: np.ndarray, bgr: tuple[in
 
 
 def _clip_edge(start: np.ndarray, end: np.ndarray, zmin: float = 0.25) -> np.ndarray | None:
+    # 线段裁到 z >= zmin。两端都在近平面后则整段丢掉。
     a_in = start[2] >= zmin
     b_in = end[2] >= zmin
     if a_in and b_in:
@@ -245,6 +251,7 @@ def render_field(
     noise_m: float = 0.004,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
+    # 斜视机位。先画地面和方块，再画场地四边，标定与识别可以分帧调用。
     color, depth = blank(intr)
     color[:] = GROUND_BGR
     ground = _quad(np.array([1.0, 0.6, 0.0]), np.array([2.4, 0.0, 0.0]), np.array([0.0, 1.8, 0.0]))
@@ -267,6 +274,7 @@ def render_field(
 
 
 def _paint_box(color, depth, intr, rotation, translation, item: dict, z_sign: float) -> None:
+    # 方块在世界系里摆好，每个面再变到相机系光栅化。z_sign 决定朝上还是朝下。
     bottom = np.array([item["x"], item["y"], item.get("z", 0.0)], dtype=float)
     for poly, bgr in box_polygons(
         bottom,
@@ -282,6 +290,7 @@ def _paint_box(color, depth, intr, rotation, translation, item: dict, z_sign: fl
 
 
 def save_rgbd(directory: Path, name: str, color: np.ndarray, depth: np.ndarray) -> None:
+    # 彩色是 8 位 BGR。深度写成毫米，0 留给没有深度的像素。
     directory.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(directory / f"{name}_color.png"), color)
     millimeters = np.zeros(depth.shape, dtype=np.uint16)
@@ -291,6 +300,7 @@ def save_rgbd(directory: Path, name: str, color: np.ndarray, depth: np.ndarray) 
 
 
 def load_rgbd(directory: Path, name: str) -> tuple[np.ndarray, np.ndarray]:
+    # 读回彩色，并把毫米深度还原成米。存盘时的 0 还原成 NaN。
     color = cv2.imread(str(directory / f"{name}_color.png"), cv2.IMREAD_COLOR)
     raw = cv2.imread(str(directory / f"{name}_depth.png"), cv2.IMREAD_UNCHANGED)
     if color is None or raw is None:

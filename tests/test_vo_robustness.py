@@ -72,6 +72,7 @@ def render(intr, rotation: np.ndarray, translation: np.ndarray, show_edges: bool
 
 
 def _paint_edges(gray: np.ndarray, intr, rotation: np.ndarray, translation: np.ndarray) -> None:
+    # 在纹理平面上画两条直角边。不画的帧应让场地边检测失败，只剩视觉跟踪。
     import cv2
 
     corner = np.array([0.0, 0.0, PLANE_Z])
@@ -87,6 +88,7 @@ def _paint_edges(gray: np.ndarray, intr, rotation: np.ndarray, translation: np.n
 
 
 def field_pose(color, depth, intr, gravity: np.ndarray):
+    # 这一帧能解出场地角就返回外参，边不在画面里返回空。
     plane = fit_ground(sample_points(depth, intr, stride=3), gravity, thresh=0.01, max_angle_deg=8.0)
     if plane is None:
         return None
@@ -94,12 +96,14 @@ def field_pose(color, depth, intr, gravity: np.ndarray):
 
 
 def _rotation_deg(estimated: np.ndarray, truth: np.ndarray) -> float:
+    # 两个旋转差多少度。用来看视觉和场地边校正之后还剩多少朝向误差。
     delta = estimated.T @ truth
     cosine = float(np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0))
     return float(np.degrees(np.arccos(cosine)))
 
 
 def run_case(intr, frames, gravities, field_frames: set[int] | None) -> dict:
+    # field_frames 为空时只跑视觉。给出帧号时，这些帧能看见边就用场地角拉回漂移。
     tracker = MotionTracker(hold_s=0.3, min_points=8)
     rows = []
     for index, ((color, depth), (rotation, translation), gravity) in enumerate(zip(frames, gravities[0], gravities[1])):
@@ -137,6 +141,7 @@ def run_case(intr, frames, gravities, field_frames: set[int] | None) -> dict:
 
 
 def _summary(result: dict) -> dict:
+    # 终点误差、过程中的最大误差，以及有多少帧真正锁上了场地边。
     rows = result["rows"]
     trans = np.array([row["trans_mm"] for row in rows])
     rot = np.array([row["rot_deg"] for row in rows])
@@ -154,6 +159,7 @@ def _summary(result: dict) -> dict:
 
 
 def build_sequence(intr, show_edges_at: set[int], noise_m: float = 0.002):
+    # 同一条轨迹渲染 24 帧。只有 show_edges_at 里的帧画场地边。
     poses = trajectory(24)
     frames = []
     gravities = []
@@ -191,6 +197,7 @@ def test_vo_alone_and_with_field_gaps():
 
 
 def main() -> None:
+    # 直接运行时打印单独视觉和穿插场地边两路的逐帧误差，方便对照。
     intr = intrinsics_for(320, 240, model="none")
     visible = set(range(24)) - set(range(8, 16))
     frames, packed = build_sequence(intr, visible)

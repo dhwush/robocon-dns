@@ -53,6 +53,7 @@ def _cube(x, y, yaw, z=0.0):
 
 
 def _distractor(x, y, yaw, color, size, height, z=0.0):
+    # 干扰物不是 0.2 m 方块。颜色、边长或高度对不上时，检测应把它排除。
     return {
         "x": x,
         "y": y,
@@ -66,6 +67,7 @@ def _distractor(x, y, yaw, color, size, height, z=0.0):
 
 
 def basic_cases() -> list[dict]:
+    # 基础要求：俯视三个方块，远近两档高度，旁边放尺寸不对的干扰物。
     far_z = 1.65
     near_z = 1.45
     far_distractors = [
@@ -94,6 +96,7 @@ def basic_cases() -> list[dict]:
 
 
 def advanced_stations() -> list[dict]:
+    # 提高要求：三个相机点位看同一组方块。外参由场地边决定，不把相机放在原点。
     cubes = [
         _cube(0.72, 0.50, 0.22),
         _cube(0.78, 0.86, -0.18),
@@ -126,6 +129,7 @@ def advanced_stations() -> list[dict]:
 
 
 def write_scenes(intr) -> None:
+    # 写出彩色、深度和真值。提高要求的标定帧不放方块，避免边被方块挡住。
     for case in basic_cases():
         color, depth = render_nadir(
             intr,
@@ -165,6 +169,7 @@ def write_scenes(intr) -> None:
 
 
 def _write_gt(name: str, cube: dict) -> None:
+    # 真值单独存 JSON，评分时不从渲染参数里反推，避免和图像生成耦在一起。
     payload = {
         "x": cube["x"],
         "y": cube["y"],
@@ -178,11 +183,13 @@ def _write_gt(name: str, cube: dict) -> None:
 
 
 def _read_gt(name: str) -> dict:
+    # 读回这一帧的世界系真值，供相对误差分档。
     with open(SCENE_DIR / f"{name}_gt.json", "r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
 def _frame(name: str, gravity: np.ndarray) -> Frame:
+    # 把存盘的彩色和深度装成与实机相同的 Frame，重力由机位决定。
     color, depth = load_rgbd(SCENE_DIR, name)
     return Frame(color, depth, gravity)
 
@@ -211,6 +218,7 @@ def _score_pose(est: dict | None, gt: dict) -> dict:
 
 
 def _square(center: np.ndarray, yaw: float, size: float) -> np.ndarray:
+    # 地面高度上的正方形四角。叠加图画在足迹所在平面，不用几何中心的 z。
     c, s = np.cos(yaw), np.sin(yaw)
     axis_x = np.array([c, s, 0.0]) * size * 0.5
     axis_y = np.array([-s, c, 0.0]) * size * 0.5
@@ -225,6 +233,7 @@ def _square(center: np.ndarray, yaw: float, size: float) -> np.ndarray:
 
 
 def _draw_square(image, intr, points_cam, bgr) -> None:
+    # 相机后方的角不画，避免投影出现在画面对面。
     if np.any(points_cam[:, 2] <= 0.05):
         return
     pixels = np.rint(project_points(points_cam, intr)).astype(np.int32)
@@ -232,6 +241,7 @@ def _draw_square(image, intr, points_cam, bgr) -> None:
 
 
 def _overlay(image, lines: list[str]) -> np.ndarray:
+    # 在图上写估计值和真值。先描黑边再写白字，深色和浅色背景都能看清。
     canvas = image.copy()
     for index, line in enumerate(lines):
         origin = (16, 32 + 28 * index)
@@ -241,11 +251,13 @@ def _overlay(image, lines: list[str]) -> np.ndarray:
 
 
 def _save_vis(name: str, image: np.ndarray) -> None:
+    # 叠加结果单独放到 vis 目录，不覆盖用来检测的原始场景图。
     VIS_DIR.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(VIS_DIR / f"{name}.png"), image)
 
 
 def _basic_overlay(intr, name: str, gt: dict, trial: dict) -> None:
+    # 俯视时相机系就是世界系。青色是真值足迹，绿色是估计足迹。
     color, _depth = load_rgbd(SCENE_DIR, name)
     gt_square = _square(np.array([gt["x"], gt["y"], gt["z"]]), gt["yaw"], gt["size"])
     _draw_square(color, intr, gt_square, (0, 255, 255))
@@ -262,6 +274,7 @@ def _basic_overlay(intr, name: str, gt: dict, trial: dict) -> None:
 
 
 def _world_overlay(intr, rotation, translation, name: str, gt: dict | None, trial: dict | None) -> None:
+    # 斜视时机位不在原点，方框要先变到相机系再画。
     color, _depth = load_rgbd(SCENE_DIR, name)
     if gt is not None:
         gt_square = _square(np.array([gt["x"], gt["y"], gt["z"]]), gt["yaw"], gt["size"])
@@ -284,6 +297,7 @@ def _world_overlay(intr, rotation, translation, name: str, gt: dict | None, tria
 
 
 def _fit_plane(frame: Frame, intr, cfg):
+    # 标定帧先拟合地面，场地边的端点才能交到这个平面上。
     depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
     gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
     return fit_ground(
@@ -295,6 +309,7 @@ def _fit_plane(frame: Frame, intr, cfg):
 
 
 def test_exam_images_match_assignment():
+    # 基础三项平均要到 4 分。提高要求每个点位先求外参，再给三个方块打分。
     intr = load_intrinsics(INTRINSICS_PATH)
     cfg = load_config("config/default.yaml")
     write_scenes(intr)

@@ -31,12 +31,12 @@ from fuse.median import average_scores, fuse_poses, score_trial
 from geom.transform import camera_to_world, load_intrinsics
 from ground.plane import fit_ground, sample_points
 
-
 # --- 单帧估计 -----------------------------------------------------------------
 # 深度清洗 → 地面 → 可见面位姿 →（可选）看不清面时的补救 → 变到世界系。
 # enable_face_fallback 默认关闭，基本项目不调用补救。
 
 def load_config(path: str) -> dict:
+    # 读主配置。若已做过颜色标定，用存盘的 HSV 覆盖默认色块，避免每次手改 yaml。
     with open(path, "r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
     hsv_path = Path(cfg.get("hsv_path", "config/hsv.yaml"))
@@ -49,6 +49,7 @@ def load_config(path: str) -> dict:
 
 
 def _bump(rejects: dict | None, reason: str) -> None:
+    # 累计丢帧原因。调用方没传计数字典时直接跳过，自检路径不必记账。
     if rejects is not None:
         rejects[reason] = int(rejects.get(reason, 0)) + 1
 
@@ -319,6 +320,7 @@ def render_cube_in_world(intr, rotation, translation, center, yaw, size: float =
 
 
 def _yaw_std_deg(samples: list[dict]) -> float:
+    # 先折到第一帧附近再求标准差。±π 两侧的连续角不能直接当普通数求差。
     yaw = np.array([s["yaw"] for s in samples], dtype=float)
     center = yaw[0]
     delta = np.arctan2(np.sin(yaw - center), np.cos(yaw - center))
@@ -344,6 +346,7 @@ def _record(fused, samples: list[dict]) -> dict:
 
 
 def _show_debug(color: np.ndarray, depth: np.ndarray, cfg: dict, record: dict, intr, corners) -> None:
+    # 调试窗口：绿色是颜色轮廓，青色是地面足迹，文字是当前世界系位姿。
     import cv2
 
     from geom.transform import project_points
@@ -387,6 +390,7 @@ def _field_pose(color, depth, intr, cfg, gravity):
 
 
 def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool, debug: bool) -> None:
+    # 实机循环。标定分支写完文件就返回；正常分支凑满样本后按 output_hz 打印 JSON。
     source = RealSenseSource(intr.width, intr.height, fps=int(cfg.get("fps", 30)))
     rotation, translation = identity_extrinsic()
     tracker = None
@@ -485,9 +489,12 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
             moved = False
             if origin is not None and last_plane is not None and np.linalg.norm(origin - last_plane) > jump_m:
                 moved = True
-            if translation is not None and last_translation is not None:
-                if np.linalg.norm(np.asarray(translation) - last_translation) > jump_m:
-                    moved = True
+            if (
+                translation is not None
+                and last_translation is not None
+                and np.linalg.norm(np.asarray(translation) - last_translation) > jump_m
+            ):
+                moved = True
             if moved:
                 samples.clear()
                 last_record = None

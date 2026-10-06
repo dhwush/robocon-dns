@@ -37,9 +37,11 @@ class Segment:
 
     @property
     def length(self) -> float:
+        # 可见长度用来分辨长边和短边。被画面裁切时会偏短，后面还要用长度误差再筛。
         return float(np.linalg.norm(self.p1 - self.p0))
 
     def midpoint(self) -> np.ndarray:
+        # 中点相对交点的一侧，就是这条边指向场地内部的方向。
         return 0.5 * (self.p0 + self.p1)
 
 
@@ -82,6 +84,7 @@ def pose_from_corner(
     field_length: float,
     field_width: float,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    # 交点是世界原点在相机系中的位置。长边对齐 X，短边对齐 Y，Z 翻到与地面法向同侧。
     corner = _intersect(edge_a, edge_b)
     if corner is None:
         return None
@@ -219,6 +222,7 @@ def calibrate_from_image(
     field_length: float,
     field_width: float,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    # 从彩色图提出场地边，再选离相机最近的角作为外参。边不在画面里就返回空。
     segments = segments_from_image(color_bgr, intr, plane)
     return estimate_from_lines(segments, plane, field_length, field_width)
 
@@ -235,6 +239,7 @@ def save_extrinsic(path: str | Path, rotation: np.ndarray, translation: np.ndarr
 
 
 def load_extrinsic(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    # 读回存盘的 R、t。相机不动、只推平台时可以复用，不必每帧都看见整圈场地边。
     with open(path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
     return np.array(payload["R"], dtype=float), np.array(payload["t"], dtype=float)

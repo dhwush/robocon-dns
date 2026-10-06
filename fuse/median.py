@@ -18,6 +18,7 @@ from geom.transform import fold_yaw_quarter, wrap_angle
 
 @dataclass
 class FusedPose:
+    """多帧中值之后的世界系位姿。yaw 已折回主值区间。"""
     x: float
     y: float
     z: float
@@ -48,6 +49,7 @@ def _align_period(angles: np.ndarray, period: float) -> np.ndarray:
 
 
 def fuse_poses(samples: list[dict], mad_scale: float = 3.0) -> FusedPose | None:
+    # 丢掉位置和 yaw 的离群帧后取中值。一帧都没有时返回空，调用方继续等待。
     if not samples:
         return None
     xyz = np.array([[s["x"], s["y"], s["z"]] for s in samples], dtype=float)
@@ -123,6 +125,7 @@ def score_trial(
     quarter: bool = True,
     axis_floor: float = 0.15,
 ) -> dict:
+    # x、y 分开算相对误差再取平均分。真值过小会在结果里标出 sensitive_percent。
     est = np.asarray(est_xy, dtype=float)
     gt = np.asarray(gt_xy, dtype=float)
     error_x = _axis_error(est[0], gt[0], axis_floor)
@@ -148,6 +151,7 @@ def score_trial(
 
 
 def average_scores(trials: list[dict]) -> dict:
+    # 多次测量取得分平均。位置和 yaw 都至少 4 分，基础要求才算通过。
     pos = float(np.mean([t["position_score"] for t in trials]))
     yaw = float(np.mean([t["yaw_score"] for t in trials]))
     return {"position": pos, "yaw": yaw, "total": pos + yaw, "basic_passed": pos >= 4.0 and yaw >= 4.0}

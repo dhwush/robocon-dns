@@ -87,15 +87,16 @@ def median_smooth(depth: np.ndarray, ksize: int = 3) -> np.ndarray:
 
 class TemporalDepthFilter:
     def __init__(self, alpha: float = 0.4):
+        # alpha 越大越跟当前帧。还没有上一帧时，apply 先把这一帧当作状态。
         self.alpha = alpha
         self._state: np.ndarray | None = None
 
     def apply(self, depth: np.ndarray) -> np.ndarray:
+        # 两帧都有效时做指数平均；当前帧是洞、上一帧有值时沿用上一帧补闪烁。
         cur = np.array(depth, dtype=float, copy=True)
         if self._state is None or self._state.shape != cur.shape:
             self._state = cur
             return cur.copy()
-        # 两帧都有值：按 alpha 混合。当前帧是洞、上一帧有值：沿用上一帧，用来补闪烁空洞。
         both = np.isfinite(cur) & np.isfinite(self._state)
         blended = self.alpha * cur + (1.0 - self.alpha) * self._state
         out = cur.copy()
@@ -131,6 +132,7 @@ class RealSenseSource:
     """彩色与深度对齐。几何用的内参始终来自配置文件，不用设备当时读出的数覆盖。"""
 
     def __init__(self, width: int = 1280, height: int = 720, fps: int = 30):
+        # 彩色、深度和惯性一起开。对齐和滤波要在回调之前建好，否则第一帧还没有这些对象。
         import pyrealsense2 as rs
 
         self._rs = rs
@@ -178,9 +180,11 @@ class RealSenseSource:
         self._lock_color()
 
     def _accel_rotation(self) -> np.ndarray:
+        # 加速度计到彩色相机的旋转。重力要先变到彩色系，再交给地面拟合。
         return self._motion_rotation(self._rs.stream.accel)
 
     def _motion_rotation(self, stream) -> np.ndarray:
+        # 读设备给出的惯性系到彩色相机的外参。读失败时退回单位阵，避免整路取流起不来。
         try:
             # 惯性系和彩色相机不一致，要用设备外参旋过来。失败时退回单位阵。
             motion = self.profile.get_stream(stream).as_motion_stream_profile()
@@ -244,6 +248,7 @@ class RealSenseSource:
             sensor.set_option(rs.option.enable_auto_white_balance, 0)
 
     def read(self) -> Frame:
+        # 等到回调写好一帧再取出。超时说明彩色或深度没来。
         if not self._event.wait(timeout=5.0):
             raise RuntimeError("missing color or depth frame")
         self._event.clear()
@@ -256,4 +261,5 @@ class RealSenseSource:
         return Frame(color=color, depth=depth, gravity=gravity, gyro=gyro)
 
     def close(self) -> None:
+        # 停掉管线，释放相机，避免下次启动报设备忙。
         self.pipeline.stop()
