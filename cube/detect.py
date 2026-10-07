@@ -39,8 +39,8 @@ class CubePose:
 # 贴地同色时，离地不足这条的点视为地面。侧面最底下贴着方块的一条留下。
 GROUND_CLEARANCE_M = 0.035
 
-# 足迹只收实测顶面往下这一条以内的点。再宽就会带上侧面顶边，矩形被拉长。
-TOP_LAYER_BELOW_PEAK_M = 0.025
+# 足迹只收实测顶面往下这一条以内的点。再宽就会带上正面上沿，矩形被拉向相机。
+TOP_LAYER_BELOW_PEAK_M = 0.010
 
 
 def _scale_for_dim_light(hsv: np.ndarray) -> float:
@@ -681,6 +681,21 @@ def _footprint(points: np.ndarray, plane: Plane) -> tuple[np.ndarray, np.ndarray
     return coords, projected, rect
 
 
+def _drop_near_camera(points: np.ndarray, plane: Plane, fraction: float = 0.05) -> np.ndarray:
+    # 投影到地面后，丢掉离相机落点最近的大约 5%。偏近的深度飞点就不会把长边撑出绿线。
+    projected = plane.project(points)
+    cam = plane.project(np.zeros(3))
+    dist = np.linalg.norm(projected - cam, axis=1)
+    drop = int(np.floor(len(points) * fraction))
+    if drop < 1 or len(points) - drop < 3:
+        return np.ones(len(points), dtype=bool)
+    cutoff = np.partition(dist, drop - 1)[drop - 1]
+    keep = dist > cutoff
+    if int(keep.sum()) < 3:
+        keep = dist >= cutoff
+    return keep
+
+
 def detect_visible_cube(
     color_bgr: np.ndarray,
     depth: np.ndarray,
@@ -723,18 +738,27 @@ def detect_visible_cube(
         return fail("inliers")
     points = points[on_cube]
     front_flag = front_flag[on_cube]
-    # 用 90 分位而不是最大值，避免一颗飞点把高度拉高。明显矮于半个边长就不是这个方块。
+    # 落地边和凸包里贴近地面的点不参与 90 分位。峰值只在离地超过半个边长的点上取。
     height = plane.signed_distance(points)
-    peak = float(np.percentile(height, 90))
+    body = height > max(GROUND_CLEARANCE_M, 0.5 * cube_size)
+    if int(body.sum()) < 3:
+        return fail("height")
+    peak = float(np.percentile(height[body], 90))
     if abs(peak - cube_size) > size_tolerance + 0.05 and peak < cube_size * 0.5:
         return fail("height")
-    # 顶面决定矩形。再往下的侧面不投到地面，偏近的深度就不会把框拉向相机。
-    top = height >= peak - TOP_LAYER_BELOW_PEAK_M
+    # 顶面往下 1 cm。正面上沿留在这层外面，投到地面时不会把框拉出绿线。
+    top = body & (height >= peak - TOP_LAYER_BELOW_PEAK_M)
     if int(top.sum()) < 3:
         return fail("height")
     # 2. 足迹要接近 0.2 m × 0.2 m。太扁说明只剩一条棱，这一帧拒绝。
-    coords, _projected, rect = _footprint(points[top], plane)
+    points_top = points[top]
     front_flag = front_flag[top]
+    keep = _drop_near_camera(points_top, plane, 0.05)
+    points_top = points_top[keep]
+    front_flag = front_flag[keep]
+    if len(points_top) < 3:
+        return fail("height")
+    coords, _projected, rect = _footprint(points_top, plane)
     (center_u, center_v), (width, height_rect), angle_deg = rect
     long_side = max(width, height_rect)
     short_side = min(width, height_rect)
@@ -744,7 +768,7 @@ def detect_visible_cube(
     if fraction < min_footprint_fraction:
         return fail("footprint_area")
     # 近处长边仍按 24 mm。更远处按 0.02*z 放宽，2 m 约 4 cm，3 m 约 6 cm，并且不超过 size_tolerance。
-    z_ref = float(np.median(points[top][:, 2]))
+    z_ref = float(np.median(points_top[:, 2]))
     if not np.isfinite(z_ref) or z_ref <= 0.0:
         z_ref = 1.0
     side_limit = min(float(size_tolerance), max(0.12 * cube_size, 0.02 * z_ref))
