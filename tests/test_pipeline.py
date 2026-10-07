@@ -3,7 +3,7 @@
 import numpy as np
 
 from camera.source import filter_depth, remove_flying_pixels
-from cube.detect import detect_visible_cube
+from cube.detect import detect_visible_cube, prepare_mask
 from cube.face_fallback import fit_when_face_missing
 from field.extrinsic import Segment, estimate_from_lines, save_extrinsic, load_extrinsic
 from fuse.median import angle_delta, average_scores, band_score, fuse_poses, score_trial
@@ -118,6 +118,76 @@ def test_dim_cube_on_red_and_blue_ground():
     )
     assert pose is not None
     assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.04
+
+
+def test_either_color_on_top_keeps_outer_contour():
+    """红面在上或蓝面在上都要检出。顶面内部的深度跳变留在掩膜里，贴地的底边也还在。"""
+    from geom.transform import deproject_pixels, project_points
+
+    intr = intrinsics_for(320, 240)
+    center = np.array([0.08, 0.06, 0.7])
+    cfg = load_config("config/default.yaml")
+    red = (40, 40, 220)
+    blue = (220, 40, 40)
+    for top_bgr, side_bgr in ((red, blue), (blue, red)):
+        color, depth = render_cube(
+            intr,
+            center,
+            0.35,
+            size=float(cfg["cube_size"]),
+            ground_z=float(center[2]),
+            noise_m=0.0,
+            top_bgr=top_bgr,
+        )
+        depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
+        from ground.plane import sample_points
+
+        plane = fit_ground(sample_points(depth_f, intr, stride=3), np.array([0.0, 0.0, 1.0]))
+        assert plane is not None
+        ys, xs = np.nonzero(np.any(color != 40, axis=2))
+        z = depth_f[ys, xs]
+        good = np.isfinite(z)
+        points = deproject_pixels(np.column_stack([xs[good], ys[good]]), z[good], intr)
+        height = plane.signed_distance(points)
+        lower = np.zeros(len(xs), dtype=bool)
+        lower[np.flatnonzero(good)] = height < 0.10
+        color[ys[lower], xs[lower]] = side_bgr
+        seam = np.zeros(len(xs), dtype=bool)
+        seam[np.flatnonzero(good)] = np.abs(height - 0.10) < 0.012
+        color[ys[seam], xs[seam]] = 40
+        top = project_points(np.array([[center[0], center[1], center[2] - 0.2]]), intr)[0]
+        u, v = int(round(float(top[0]))), int(round(float(top[1])))
+        depth_f[v, u] += 0.05
+        prepared = prepare_mask(
+            color,
+            depth_f,
+            cfg["colors"],
+            float(cfg["depth_min"]),
+            float(cfg["depth_max"]),
+            plane=plane,
+            intr=intr,
+            cube_size=float(cfg["cube_size"]),
+        )
+        assert prepared is not None
+        assert prepared[0][v, u] > 0
+        pose = detect_visible_cube(
+            color,
+            depth_f,
+            intr,
+            plane,
+            cfg["colors"],
+            cube_size=float(cfg["cube_size"]),
+            min_pixels=200,
+            min_footprint_fraction=0.35,
+            size_tolerance=float(cfg["size_tolerance"]),
+            prepared=prepared,
+        )
+        assert pose is not None
+        assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.04
+        on = prepared[0][ys, xs] > 0
+        bottom = np.zeros(len(xs), dtype=bool)
+        bottom[np.flatnonzero(good)] = (height > 0.0) & (height < 0.03)
+        assert int(on[bottom].sum()) > 20
 
 
 def test_field_corner_recovers_extrinsic(tmp_path):

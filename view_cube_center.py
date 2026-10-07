@@ -1,7 +1,7 @@
 """实时查看方块识别和体心。
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
-这一路不读、不画棱方向和 yaw。按 q 或 Esc 退出。
+橙色线是当前拟合的地面。这一路不读、不画棱方向和 yaw。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
@@ -15,7 +15,7 @@ import numpy as np
 
 from camera.source import RealSenseSource, filter_depth
 from cube.detect import detect_visible_cube, prepare_mask
-from geom.transform import load_intrinsics, project_points
+from geom.transform import deproject_pixels, load_intrinsics, project_points
 from ground.plane import fit_ground, sample_points
 from main import load_config
 
@@ -42,6 +42,30 @@ def _label(image: np.ndarray, lines: list[str]) -> None:
         cv2.putText(image, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(image, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
         y += 28
+
+
+def _draw_ground(image: np.ndarray, depth: np.ndarray, intr, plane, thresh: float) -> None:
+    # 贴在拟合平面上的深度连成一块，画出它的外轮廓。方块高出地面，不进这条线。
+    stride = 8
+    vs, us = np.mgrid[0 : depth.shape[0] : stride, 0 : depth.shape[1] : stride]
+    z = depth[vs, us]
+    good = np.isfinite(z)
+    if int(good.sum()) < 30:
+        return
+    points = deproject_pixels(
+        np.column_stack([us[good].ravel(), vs[good].ravel()]),
+        z[good].ravel(),
+        intr,
+    )
+    on = np.abs(plane.signed_distance(points)) < thresh
+    if int(on.sum()) < 30:
+        return
+    mask = np.zeros(depth.shape[:2], dtype=np.uint8)
+    mask[vs[good][on], us[good][on]] = 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (stride * 2 + 1, stride * 2 + 1))
+    mask = cv2.dilate(mask, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(image, contours, -1, (0, 140, 255), 2, cv2.LINE_AA)
 
 
 def _body_center(bottom: np.ndarray, plane, height: float) -> np.ndarray:
@@ -71,6 +95,7 @@ def main() -> None:
             vis = frame.color.copy()
             prepared = None
             if plane is not None:
+                _draw_ground(vis, depth, intr, plane, float(cfg["ground_ransac_thresh"]))
                 prepared = prepare_mask(
                     frame.color,
                     depth,

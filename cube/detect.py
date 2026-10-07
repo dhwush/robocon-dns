@@ -32,11 +32,14 @@ class CubePose:
 
 # --- 颜色分割 -----------------------------------------------------------------
 # 开运算去掉孤立色点，闭运算补小洞。红色在色相环两端，配置里写成两段再并起来。
-# 实机方块上半纯红、下半纯蓝，两色并进同一块掩膜。水平分界绕四周，不标成正面，yaw 仍按 90° 对称。
+# 实机方块上下两半是红和蓝，哪一面在上都可以，两色并进同一块掩膜。水平分界绕四周，不标成正面，yaw 仍按 90° 对称。
 # 地面漆成红或蓝时，贴地 3.5 cm 以内的颜色点稍后按高度丢掉，不靠把色相收窄来区分。
 
 # 贴地同色时，离地不足这条的点视为地面。侧面最底下会少一条，顶面和其余侧面还在。
 GROUND_CLEARANCE_M = 0.035
+
+# 足迹只收实测顶面往下这一条以内的点。侧面还在掩膜里，但不参与矩形。
+TOP_LAYER_BELOW_PEAK_M = 0.04
 
 
 def _scale_for_dim_light(hsv: np.ndarray) -> float:
@@ -67,6 +70,10 @@ def color_mask(color_bgr: np.ndarray, colors: list[dict]) -> tuple[np.ndarray, n
         mask = cv2.bitwise_or(mask, part)
         if spec.get("front"):
             front = cv2.bitwise_or(front, part)
+    # 红蓝接缝大约十个像素。哪一面在上都能并成一块，缝留在内部，不把轮廓拉进面里。
+    bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge)
+    front = cv2.bitwise_and(front, mask)
     return mask, front
 
 
@@ -84,8 +91,9 @@ def _keep_above_ground(
     zmin: float,
     zmax: float,
 ) -> np.ndarray:
-    # 明显高于地面的颜色点留下。贴地 3.5 cm 里，只有落在这些点占地范围内的才留下，
-    # 这样方块落地的边还在，铺开的红蓝地面进不了轮廓。
+    # 明显高于地面的颜色点留下。贴地的底边按图像上的邻域留在方块上，
+    # 不按地面投影去裁，否则侧面深度偏近时底边会从轮廓上消失。
+    # 铺开的同色地面离这块面远，进不了这一圈。红面或蓝面在上都不看色相。
     ys, xs = np.nonzero(mask)
     kept = np.zeros(mask.shape, dtype=np.uint8)
     if len(xs) == 0:
@@ -97,33 +105,23 @@ def _keep_above_ground(
     points = deproject_pixels(np.column_stack([xs[good], ys[good]]), z[good], intr)
     height = plane.signed_distance(points)
     elevated = (height > GROUND_CLEARANCE_M) & (height < cube_size + 0.08)
+    if int(elevated.sum()) < 10:
+        return kept
+    body = np.zeros(mask.shape, dtype=np.uint8)
+    body[ys[good][elevated], xs[good][elevated]] = 255
+    z_med = float(np.median(z[good][elevated]))
+    radius = int(np.ceil(1.5 * GROUND_CLEARANCE_M * float(intr.fx) / max(z_med, 1e-3)))
+    radius = int(np.clip(radius, 6, 64))
+    near = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)))
     keep = elevated.copy()
     contact = (height > -0.02) & (height <= GROUND_CLEARANCE_M)
-    if int(elevated.sum()) >= 10 and int(contact.sum()) > 0:
-        # 先在图像上只留挨着方块的一圈，避免整片红蓝地面都去做占地判断。
-        body = np.zeros(mask.shape, dtype=np.uint8)
-        body[ys[good][elevated], xs[good][elevated]] = 255
-        near = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
-        contact_near = contact & (near[ys[good], xs[good]] > 0)
-        if int(contact_near.sum()) > 0:
-            axis_x, axis_y = plane.basis()
-            origin = plane.origin()
-            elevated_xy = points[elevated] - origin
-            elev_uv = np.column_stack([elevated_xy @ axis_x, elevated_xy @ axis_y]).astype(np.float32)
-            hull = cv2.convexHull(elev_uv).reshape(-1, 2)
-            if len(hull) >= 3:
-                contact_xy = points[contact_near] - origin
-                contact_uv = np.column_stack([contact_xy @ axis_x, contact_xy @ axis_y])
-                start = hull
-                end = np.roll(hull, -1, axis=0)
-                edge = end - start
-                offset = contact_uv[:, None, :] - start[None, :, :]
-                cross = edge[None, :, 0] * offset[:, :, 1] - edge[None, :, 1] * offset[:, :, 0]
-                # 允许落在轮廓外 8 mm，把落地边留在方块里，又不把旁边的地面卷进来。
-                distance = cross / (np.linalg.norm(edge, axis=1) + 1e-8)
-                inside = np.all(distance >= -0.008, axis=1)
-                keep[np.flatnonzero(contact_near)[inside]] = True
+    keep[contact & (near[ys[good], xs[good]] > 0)] = True
     kept[ys[good][keep], xs[good][keep]] = 255
+    # 面上没有深度的颜色点也留下，洞才不会把轮廓拉进去。
+    color_near = cv2.bitwise_and(mask, near)
+    has_depth = np.zeros(mask.shape, dtype=bool)
+    has_depth[ys[good], xs[good]] = True
+    kept[(color_near > 0) & ~has_depth] = 255
     return kept
 
 
@@ -178,8 +176,9 @@ def _select_component(
         filled = np.zeros(mask.shape, dtype=np.uint8)
         cv2.drawContours(filled, [contour], -1, 255, thickness=-1)
         component = cv2.bitwise_and(mask, filled)
-        component = cv2.bitwise_and(component, valid.astype(np.uint8) * 255)
-        ys, xs = np.nonzero(component)
+        # 深度只用来判断这块是不是方块。面上的深度洞不从掩膜里挖掉，轮廓才留在外沿。
+        measured = cv2.bitwise_and(component, valid.astype(np.uint8) * 255)
+        ys, xs = np.nonzero(measured)
         if len(xs) == 0:
             continue
         samples = depth[ys, xs]
@@ -207,7 +206,7 @@ def _erode_radius(distance_m: float) -> int:
 
 
 def _drop_edge_jumps(depth: np.ndarray, mask: np.ndarray, thresh_m: float = 0.015) -> np.ndarray:
-    """轮廓附近深度跳变超过 15 mm 的点从掩膜去掉。整幅图的 80 mm 飞点过滤在这之前已经做过。"""
+    """只去掉外轮廓附近深度跳变超过 15 mm 的点。面的内部保持连续。整幅图的 80 mm 飞点过滤在这之前已经做过。"""
     from camera.source import remove_flying_pixels
 
     ys, xs = np.nonzero(mask)
@@ -219,14 +218,28 @@ def _drop_edge_jumps(depth: np.ndarray, mask: np.ndarray, thresh_m: float = 0.01
     x0 = max(int(xs.min()) - 1, 0)
     x1 = min(int(xs.max()) + 2, mask.shape[1])
     sub = mask[y0:y1, x0:x1]
+    # 外轮廓向内约 3 像素。红蓝接缝和斜侧面在内部，上面的跳变留下。
+    rim_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    rim = cv2.subtract(sub, cv2.erode(sub, rim_kernel))
     local = np.where(sub > 0, depth[y0:y1, x0:x1], np.nan)
     cleaned = remove_flying_pixels(local, thresh_m)
     updated = sub.copy()
-    on = sub > 0
-    updated[on] = np.where(np.isfinite(cleaned[on]), 255, 0).astype(np.uint8)
+    on_rim = rim > 0
+    updated[on_rim] = np.where(np.isfinite(cleaned[on_rim]), 255, 0).astype(np.uint8)
     kept = mask.copy()
     kept[y0:y1, x0:x1] = updated
     return kept
+
+
+def _fill_enclosed(mask: np.ndarray) -> np.ndarray:
+    # 封在面内部的洞补上。外轮廓本身不向外扩。
+    if int(np.count_nonzero(mask)) == 0:
+        return mask
+    flood = mask.copy()
+    pad = np.zeros((mask.shape[0] + 2, mask.shape[1] + 2), np.uint8)
+    cv2.floodFill(flood, pad, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(mask, holes)
 
 
 def prepare_mask(
@@ -239,8 +252,8 @@ def prepare_mask(
     intr=None,
     cube_size: float = 0.2,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    # 先收成一块轮廓，再按距离腐蚀，并丢掉轮廓附近 15 mm 以上的深度跳变。
-    # 有地面时先去掉贴地的颜色点，红蓝地面不会和方块连成一块。
+    # 先收成一块轮廓。深度跳变只去掉外轮廓那一圈，面的内部保持连续。
+    # 有地面时先去掉铺开的贴地颜色，方块底边留在轮廓上。红面或蓝面在上用的是同一条路径。
     mask, front = color_mask(color_bgr, colors)
     if plane is not None and intr is not None:
         above = _keep_above_ground(mask, depth, intr, plane, cube_size, zmin, zmax)
@@ -265,6 +278,7 @@ def prepare_mask(
         mask = cv2.erode(mask, kernel)
         front = cv2.bitwise_and(front, mask)
     mask = _drop_edge_jumps(depth, mask, 0.015)
+    mask = _fill_enclosed(mask)
     front = cv2.bitwise_and(front, mask)
     if int(np.count_nonzero(mask)) < 10:
         return None
@@ -376,7 +390,8 @@ def _mask_points(
 
 
 # --- 地面足迹 -----------------------------------------------------------------
-# 点沿地面法向压到平面上，再用最小外接矩形量水平跨度。垂直面压下去会变成一条线。
+# 点沿地面法向压到平面上，再用最小外接矩形量水平跨度。
+# 矩形只用接近顶面的一层。侧面深度偏近时会在靠近相机的一侧铺开，不拿来撑矩形。
 # 不拟合上表面，因此没有上表面 RMS、12° 法向和 6 mm 正方形残差。
 # 长边、短边、面积三道门限仍然把不合格的足迹丢掉。
 
@@ -421,7 +436,7 @@ def detect_visible_cube(
         return None
 
     # 1. 颜色点是否够多，并且贴在地面以上、高度接近方块边长。
-    # 地面投影要用可见的侧面和顶面一起收成足迹，不用“离地 0.4h 再拟合顶面”那一步。
+    # 足迹只投接近顶面的一层。侧面留在掩膜里，不参与矩形。
     packed = _mask_points(
         color_bgr, depth, intr, colors, zmin, zmax, plane, cube_size, prepared=prepared
     )
@@ -438,11 +453,17 @@ def detect_visible_cube(
     points = points[on_cube]
     front_flag = front_flag[on_cube]
     # 用 90 分位而不是最大值，避免一颗飞点把高度拉高。明显矮于半个边长就不是这个方块。
-    peak = float(np.percentile(plane.signed_distance(points), 90))
+    height = plane.signed_distance(points)
+    peak = float(np.percentile(height, 90))
     if abs(peak - cube_size) > size_tolerance + 0.05 and peak < cube_size * 0.5:
         return fail("height")
+    # 顶面决定矩形。再往下的侧面不投到地面，偏近的深度就不会把框拉向相机。
+    top = height >= peak - TOP_LAYER_BELOW_PEAK_M
+    if int(top.sum()) < 3:
+        return fail("height")
     # 2. 足迹要接近 0.2 m × 0.2 m。太扁说明只剩一条棱，这一帧拒绝。
-    coords, _projected, rect = _footprint(points, plane)
+    coords, _projected, rect = _footprint(points[top], plane)
+    front_flag = front_flag[top]
     (center_u, center_v), (width, height_rect), angle_deg = rect
     long_side = max(width, height_rect)
     short_side = min(width, height_rect)
