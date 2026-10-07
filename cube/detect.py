@@ -39,8 +39,9 @@ class CubePose:
 # 贴地同色时，离地不足这条的点视为地面。侧面最底下贴着方块的一条留下。
 GROUND_CLEARANCE_M = 0.035
 
-# 足迹只收实测顶面往下这一条以内的点。再宽就会带上正面上沿，矩形被拉向相机。
+# 足迹先收实测顶面往下 1 cm。这一层面积不够时，再放到 2.5 cm，不把上半截整面投进去。
 TOP_LAYER_BELOW_PEAK_M = 0.010
+FOOTPRINT_FALLBACK_BELOW_PEAK_M = 0.025
 
 
 def _hue_range(hsv: np.ndarray, spec: dict, s_low: int, v_low: int, v_high: int = 255) -> np.ndarray:
@@ -202,9 +203,11 @@ def _top_seeds(
     cube_size: float,
     limit: int = 3,
 ) -> list[np.ndarray]:
-    # 长边可以短到半个边长，偏长不超过 max(4 cm, 0.02z)。高度 90 分位仍要接近边长。
+    # 先留长边离边长不超过 max(4 cm, 0.02z) 的。一块都没有时，再留下短到 0.65 倍边长的。
+    # 偏长的仍然丢掉。两组里都按像素从多到少排。
     count, labels = cv2.connectedComponents(blob, connectivity=8)
-    passed: list[tuple[int, np.ndarray]] = []
+    tight: list[tuple[int, np.ndarray]] = []
+    short: list[tuple[int, np.ndarray]] = []
     for lab in range(1, count):
         seed = (labels == lab) & (elev > 0)
         n_seed = int(seed.sum())
@@ -224,8 +227,8 @@ def _top_seeds(
         long_side = _span_long_side(seed.astype(np.uint8) * 255, depth, intr, plane)
         if long_side is None or long_side > cube_size * 2.5:
             continue
-        # 红顶缺深度时跨度会偏短，仍留下。偏长的是红地面或木台并进来，丢掉。
-        if long_side < 0.5 * cube_size or long_side > cube_size + max(0.04, 0.02 * z_med):
+        band = max(0.04, 0.02 * z_med)
+        if long_side > cube_size + band or long_side < 0.65 * cube_size:
             continue
         heights = height_img[seed]
         heights = heights[np.isfinite(heights)]
@@ -234,7 +237,11 @@ def _top_seeds(
         peak = float(np.percentile(heights, 90))
         if peak < 0.5 * cube_size or peak > cube_size + 0.08:
             continue
-        passed.append((n_seed, seed))
+        if long_side >= cube_size - band:
+            tight.append((n_seed, seed))
+        else:
+            short.append((n_seed, seed))
+    passed = tight or short
     passed.sort(key=lambda item: item[0], reverse=True)
     return [seed for _n, seed in passed[:limit]]
 
@@ -798,7 +805,7 @@ def detect_visible_cube(
     if abs(peak - cube_size) > size_tolerance + 0.05 and peak < cube_size * 0.5:
         return fail("height")
     # 顶面往下 1 cm。这一层面积够时，正面上沿留在矩形外面。
-    # 斜视时 1 cm 只剩近处一条，面积不够就改用离地超过半个边长的点。
+    # 斜视时 1 cm 只剩近处一条，面积不够就改用顶面往下 2.5 cm 的点。
     def measured(layer: np.ndarray):
         if int(layer.sum()) < 3:
             return None
@@ -818,13 +825,8 @@ def detect_visible_cube(
 
     top = body & (height >= peak - TOP_LAYER_BELOW_PEAK_M)
     chosen = measured(top)
-    print(
-        "DBG",
-        int(top.sum()),
-        None if chosen is None else (round(chosen[3], 3), round(chosen[4], 3), round(chosen[5], 3), len(chosen[0])),
-    )
     if chosen is None or chosen[3] < min_footprint_fraction:
-        wider = measured(body)
+        wider = measured(body & (height >= peak - FOOTPRINT_FALLBACK_BELOW_PEAK_M))
         if wider is not None:
             chosen = wider
     if chosen is None:

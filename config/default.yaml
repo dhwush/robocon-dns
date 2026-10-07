@@ -53,6 +53,6 @@ colors:
     hsv_high: [180, 255, 255]
     front: false
   - name: blue
-    hsv_low: [100, 80, 50]
-    hsv_high: [130, 255, 255]
+    hsv_low: [104, 95, 65]
+    hsv_high: [128, 255, 255]
     front: false
