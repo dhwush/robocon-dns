@@ -1,23 +1,24 @@
 """实时查看方块识别和体心。
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
-橙色线是当前拟合的地面。这一路不读、不画棱方向和 yaw。按 q 或 Esc 退出。
+橙色线是拟合地面上最大的一块，内点放宽到 18 mm。这一路不读、不画棱方向和 yaw。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
 
 from __future__ import annotations
 
+import argparse
 import time
 
 import cv2
 import numpy as np
 
-from camera.source import RealSenseSource, filter_depth
+from camera.source import RealSenseSource, color_lock_from_config, filter_depth
 from cube.detect import detect_visible_cube, prepare_mask
-from geom.transform import deproject_pixels, load_intrinsics, project_points
+from geom.transform import deproject_pixels, project_points
 from ground.plane import fit_ground, plane_holds, sample_points
-from main import load_config
+from main import live_intrinsics, load_config
 
 
 def _pixel(point: np.ndarray, intr) -> tuple[int, int] | None:
@@ -45,8 +46,10 @@ def _label(image: np.ndarray, lines: list[str]) -> None:
 
 
 def _draw_ground(image: np.ndarray, depth: np.ndarray, intr, plane, thresh: float) -> None:
-    # 贴在拟合平面上的深度连成一块，画出它的外轮廓。方块高出地面，不进这条线。
+    # 拟合仍用 8 mm。橙线放宽到至少 18 mm，只画最大的一块，刨花板上的碎斑不画。
+    # 方块高出地面，不进这条线。
     stride = 8
+    draw_thresh = max(float(thresh), 0.018)
     vs, us = np.mgrid[0 : depth.shape[0] : stride, 0 : depth.shape[1] : stride]
     z = depth[vs, us]
     good = np.isfinite(z)
@@ -57,7 +60,7 @@ def _draw_ground(image: np.ndarray, depth: np.ndarray, intr, plane, thresh: floa
         z[good].ravel(),
         intr,
     )
-    on = np.abs(plane.signed_distance(points)) < thresh
+    on = np.abs(plane.signed_distance(points)) < draw_thresh
     if int(on.sum()) < 30:
         return
     mask = np.zeros(depth.shape[:2], dtype=np.uint8)
@@ -65,7 +68,10 @@ def _draw_ground(image: np.ndarray, depth: np.ndarray, intr, plane, thresh: floa
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (stride * 2 + 1, stride * 2 + 1))
     mask = cv2.dilate(mask, kernel)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(image, contours, -1, (0, 140, 255), 2, cv2.LINE_AA)
+    if not contours:
+        return
+    largest = max(contours, key=cv2.contourArea)
+    cv2.drawContours(image, [largest], -1, (0, 140, 255), 2, cv2.LINE_AA)
 
 
 def _body_center(bottom: np.ndarray, plane, height: float) -> np.ndarray:
@@ -74,9 +80,19 @@ def _body_center(bottom: np.ndarray, plane, height: float) -> np.ndarray:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="查看方块识别和体心")
+    parser.add_argument("--light", default=None, help="亮度档：bright、daylight、indoor、dim、dark")
+    args = parser.parse_args()
     cfg = load_config("config/default.yaml")
-    intr = load_intrinsics("config/intrinsics.yaml")
-    source = RealSenseSource(intr.width, intr.height, fps=int(cfg.get("fps", 30)))
+    color_lock = color_lock_from_config(cfg, args.light)
+    serial, intr = live_intrinsics()
+    source = RealSenseSource(
+        intr.width,
+        intr.height,
+        fps=int(cfg.get("fps", 30)),
+        serial=serial,
+        color_lock=color_lock,
+    )
     height = float(cfg["cube_size"])
     last = time.monotonic()
     fps = 0.0
@@ -121,7 +137,8 @@ def main() -> None:
                 mask_view = prepared[0]
                 contours, _ = cv2.findContours(mask_view, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(vis, contours, -1, (0, 255, 0), 2)
-            lines = [f"{fps:.0f} fps"]
+            lock = color_lock
+            lines = [f"{fps:.0f} fps  {lock['name']}  exp {lock['exposure']:.0f}  gain {lock['gain']:.0f}"]
             if plane is None:
                 lines.append("no ground")
             elif prepared is None:

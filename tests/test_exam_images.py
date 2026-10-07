@@ -10,13 +10,13 @@ import numpy as np
 from camera.source import Frame, filter_depth
 from field.extrinsic import calibrate_from_image
 from fuse.median import average_scores, score_trial
-from geom.transform import fold_yaw_quarter, load_intrinsics, project_points, world_to_camera
+from geom.transform import fold_yaw_quarter, load_intrinsics_for_serial, project_points, world_to_camera
 from ground.plane import fit_ground, sample_points
 from main import estimate_frame, load_config
 from sim.exam_scene import (
     BLUE_BGR,
+    EXAM_SERIAL,
     GREEN_BGR,
-    INTRINSICS_PATH,
     RED_BGR,
     SCENE_DIR,
     VIS_DIR,
@@ -314,7 +314,7 @@ def _fit_plane(frame: Frame, intr, cfg):
 
 def test_exam_images_match_assignment():
     # 基础三项平均要到 4 分。提高要求每个点位先求外参，再给三个方块打分。
-    intr = load_intrinsics(INTRINSICS_PATH)
+    intr = load_intrinsics_for_serial(EXAM_SERIAL)
     cfg = load_config("config/default.yaml")
     write_scenes(intr)
 

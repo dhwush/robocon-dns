@@ -116,18 +116,15 @@ class Intrinsics:
         return np.array([self.k1, self.k2, self.p1, self.p2, self.k3], dtype=float)
 
 
-def load_intrinsics(path: str | Path) -> Intrinsics:
-    # 唯一入口。调用方不应再拿 RealSense 出厂内参覆盖这些数。
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
+def _intrinsics_from_raw(raw: dict, fx: float, fy: float, cx: float, cy: float) -> Intrinsics:
     k1, k2, p1, p2, k3 = raw["D"]
     return Intrinsics(
         width=int(raw["width"]),
         height=int(raw["height"]),
-        fx=float(raw["fx"]),
-        fy=float(raw["fy"]),
-        cx=float(raw["cx"]),
-        cy=float(raw["cy"]),
+        fx=float(fx),
+        fy=float(fy),
+        cx=float(cx),
+        cy=float(cy),
         k1=float(k1),
         k2=float(k2),
         p1=float(p1),
@@ -135,6 +132,26 @@ def load_intrinsics(path: str | Path) -> Intrinsics:
         k3=float(k3),
         distortion_model=str(raw["distortion_model"]),
     )
+
+
+def load_intrinsics(path: str | Path) -> Intrinsics:
+    # 读一份已经写明焦距和主点的文件。实机按序列号走 load_intrinsics_for_serial。
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    return _intrinsics_from_raw(raw, raw["fx"], raw["fy"], raw["cx"], raw["cy"])
+
+
+def load_intrinsics_for_serial(serial: str, path: str | Path = "config/cameras.yaml") -> Intrinsics:
+    # 序列号对上表里的一台。表外的号码不拿另一台的内参顶上。
+    serial = str(serial)
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    cameras = {str(key): value for key, value in (raw.get("cameras") or {}).items()}
+    spec = cameras.get(serial)
+    if spec is None:
+        known = ", ".join(sorted(cameras))
+        raise KeyError(f"序列号 {serial} 没有彩色内参。表内有: {known}")
+    return _intrinsics_from_raw(raw, spec["fx"], spec["fy"], spec["cx"], spec["cy"])
 
 
 # --- 径向畸变 -----------------------------------------------------------------

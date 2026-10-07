@@ -1,6 +1,6 @@
 """深度预处理与 D435i 取流。
 
-几何计算始终用配置文件里的内参，不用设备当时读出的内参覆盖。
+几何计算按接上的序列号用表内彩色内参，不用设备当时读出的内参覆盖。
 """
 
 from __future__ import annotations
@@ -128,17 +128,62 @@ def filter_depth(
 # 彩色曝光和白平衡锁定。
 # 加速度静止时指向“上”，重力取反方向，并旋到彩色相机坐标系。
 
-class RealSenseSource:
-    """彩色与深度对齐。几何用的内参始终来自配置文件，不用设备当时读出的数覆盖。"""
+def color_lock_from_config(cfg: dict, level: str | None = None) -> dict:
+    # 档位只改曝光、增益和亮度偏移。自动曝光仍关闭，避免平台一动颜色阈值跟着漂。
+    levels = cfg.get("light_levels") or {}
+    name = str(level or cfg.get("light") or "daylight")
+    spec = levels.get(name)
+    if spec is None:
+        known = ", ".join(str(key) for key in levels) or "无"
+        raise SystemExit(f"没有亮度档 {name}。可选: {known}")
+    return {
+        "name": name,
+        "exposure": float(spec["exposure"]),
+        "gain": float(spec["gain"]),
+        "brightness": float(spec["brightness"]),
+    }
 
-    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30):
+
+def list_camera_serials() -> list[str]:
+    # 只问当前接上的设备号码，不打开彩色和深度流。没接相机时返回空列表。
+    try:
+        import pyrealsense2 as rs
+    except ImportError:
+        return []
+    try:
+        devices = rs.context().query_devices()
+    except Exception:
+        return []
+    serials: list[str] = []
+    for device in devices:
+        try:
+            serials.append(str(device.get_info(rs.camera_info.serial_number)))
+        except Exception:
+            continue
+    return serials
+
+
+class RealSenseSource:
+    """彩色与深度对齐。几何用的内参按这台的序列号从表里取，不用设备当时读出的数覆盖。"""
+
+    def __init__(
+        self,
+        width: int = 1280,
+        height: int = 720,
+        fps: int = 30,
+        serial: str | None = None,
+        color_lock: dict | None = None,
+    ):
         # 彩色、深度和惯性一起开。对齐和滤波要在回调之前建好，否则第一帧还没有这些对象。
         import pyrealsense2 as rs
 
         self._rs = rs
         self.pipeline = rs.pipeline()
         config = rs.config()
-        # 彩色、深度、加速度一起开。几何仍用配置内参，这里的分辨率只决定取流大小。
+        if serial:
+            # 接了多台时只开号码相符的那台，避免内参和画面不是同一台。
+            config.enable_device(str(serial))
+        # 彩色、深度、加速度一起开。几何仍用表内内参，这里的分辨率只决定取流大小。
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
         config.enable_stream(rs.stream.accel)
@@ -153,6 +198,7 @@ class RealSenseSource:
         self._gyro_ready = False
         self._video_ready = False
         self.depth_scale = np.float32(0.001)
+        self._color_lock = color_lock or {"name": "daylight", "exposure": 50, "gain": 16, "brightness": 0}
         # 对齐和时间滤波要在启动回调之前建好，否则第一帧进来时还没有这些对象。
         self.align = rs.align(rs.stream.color)
         self.temporal_rs = rs.temporal_filter()
@@ -165,7 +211,12 @@ class RealSenseSource:
             config.disable_stream(rs.stream.gyro)
             self.profile = self.pipeline.start(config, self._on_frame)
             self._gyro_on = False
-        self.depth_scale = np.float32(self.profile.get_device().first_depth_sensor().get_depth_scale())
+        device = self.profile.get_device()
+        self.serial = str(device.get_info(rs.camera_info.serial_number))
+        if serial is not None and self.serial != str(serial):
+            self.close()
+            raise RuntimeError(f"打开的相机是 {self.serial}，不是 {serial}")
+        self.depth_scale = np.float32(device.first_depth_sensor().get_depth_scale())
         self._accel_to_color = self._accel_rotation()
         if self._gyro_on:
             self._gyro_to_color = self._motion_rotation(rs.stream.gyro)
@@ -265,9 +316,10 @@ class RealSenseSource:
             return
         if sensor.supports(rs.option.enable_auto_exposure):
             sensor.set_option(rs.option.enable_auto_exposure, 0)
-        self._set_clamped(sensor, rs.option.exposure, 50)
-        self._set_clamped(sensor, rs.option.gain, 16)
-        self._set_clamped(sensor, rs.option.brightness, 0)
+        lock = self._color_lock
+        self._set_clamped(sensor, rs.option.exposure, lock["exposure"])
+        self._set_clamped(sensor, rs.option.gain, lock["gain"])
+        self._set_clamped(sensor, rs.option.brightness, lock["brightness"])
         if sensor.supports(rs.option.enable_auto_white_balance):
             sensor.set_option(rs.option.enable_auto_white_balance, 0)
 

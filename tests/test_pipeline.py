@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from camera.source import filter_depth, remove_flying_pixels
+from camera.source import color_lock_from_config, filter_depth, remove_flying_pixels
 from cube.detect import detect_visible_cube, prepare_mask
 from cube.face_fallback import fit_when_face_missing
 from field.extrinsic import Segment, estimate_from_lines, save_extrinsic, load_extrinsic
@@ -12,6 +12,28 @@ from ground.plane import Plane, fit_ground
 from main import estimate_frame, load_config
 from camera.source import Frame
 from sim.scene import intrinsics_for, render_cube
+
+
+def test_light_levels_change_exposure_gain_and_brightness():
+    """亮度档改曝光、增益和亮度偏移。默认白天档保持当前锁定值，没有的档位不静默退回。"""
+    cfg = load_config("config/default.yaml")
+    daylight = color_lock_from_config(cfg)
+    assert daylight["name"] == "daylight"
+    assert daylight["exposure"] == 50
+    assert daylight["gain"] == 16
+    assert daylight["brightness"] == 0
+    dark = color_lock_from_config(cfg, "dark")
+    assert dark["exposure"] > daylight["exposure"]
+    assert dark["gain"] > daylight["gain"]
+    assert dark["brightness"] > daylight["brightness"]
+    bright = color_lock_from_config(cfg, "bright")
+    assert bright["exposure"] < daylight["exposure"]
+    assert bright["brightness"] < daylight["brightness"]
+    try:
+        color_lock_from_config(cfg, "noon")
+    except SystemExit:
+        return
+    raise AssertionError("unknown light level should be rejected")
 
 
 def test_flying_pixels_removed():
@@ -188,6 +210,67 @@ def test_either_color_on_top_keeps_outer_contour():
         bottom = np.zeros(len(xs), dtype=bool)
         bottom[np.flatnonzero(good)] = (height > 0.0) & (height < 0.03)
         assert int(on[bottom].sum()) > 20
+
+
+def test_mask_stays_on_cube_when_background_is_raised():
+    """旁边一块没有红蓝的凸起，和远处稀疏红点，都不能进绿线。足迹仍落在方块上。"""
+    from geom.transform import project_points
+
+    intr = intrinsics_for(320, 240)
+    center = np.array([0.08, 0.06, 0.7])
+    cfg = load_config("config/default.yaml")
+    color, depth = render_cube(
+        intr,
+        center,
+        0.2,
+        size=float(cfg["cube_size"]),
+        ground_z=float(center[2]),
+        noise_m=0.0,
+        top_bgr=(40, 40, 220),
+        front_bgr=(220, 40, 40),
+    )
+    board = project_points(np.array([[0.55, 0.06, 0.62]]), intr)[0]
+    bu, bv = int(round(float(board[0]))), int(round(float(board[1])))
+    color[bv - 12 : bv + 12, bu - 16 : bu + 16] = (140, 140, 140)
+    depth[bv - 12 : bv + 12, bu - 16 : bu + 16] = 0.55
+    specks = project_points(
+        np.array([[-0.45 + 0.04 * i, -0.25, 0.55] for i in range(6)]),
+        intr,
+    )
+    for u, v in np.rint(specks).astype(int):
+        color[v - 1 : v + 2, u - 1 : u + 2] = (40, 40, 220)
+        depth[v - 1 : v + 2, u - 1 : u + 2] = 0.55
+    depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
+    from ground.plane import sample_points
+
+    plane = fit_ground(sample_points(depth_f, intr, stride=3), np.array([0.0, 0.0, 1.0]))
+    assert plane is not None
+    prepared = prepare_mask(
+        color,
+        depth_f,
+        cfg["colors"],
+        float(cfg["depth_min"]),
+        float(cfg["depth_max"]),
+        plane=plane,
+        intr=intr,
+        cube_size=float(cfg["cube_size"]),
+    )
+    assert prepared is not None
+    assert int(prepared[0][bv - 8 : bv + 8, bu - 8 : bu + 8].sum()) == 0
+    pose = detect_visible_cube(
+        color,
+        depth_f,
+        intr,
+        plane,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        min_pixels=200,
+        min_footprint_fraction=0.35,
+        size_tolerance=float(cfg["size_tolerance"]),
+        prepared=prepared,
+    )
+    assert pose is not None
+    assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.04
 
 
 def test_field_corner_recovers_extrinsic(tmp_path):

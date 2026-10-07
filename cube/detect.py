@@ -32,7 +32,8 @@ class CubePose:
 
 # --- 颜色分割 -----------------------------------------------------------------
 # 红色在色相环两端，配置里写成两段再并起来。方块上下两半是红和蓝，哪一面在上都可以。
-# 绿线是这块颜色的凸外沿，搜索范围按方块在该距离上的像素大小封住。
+# 绿线只描成片的严格红蓝。放宽颜色只补大约 10 px 的接缝，搜索不超过一个边长。
+# 没有深度的点不拿来撑外沿，凸包也不把方块和旁边木板之间的地面填进掩膜。
 # 地面漆成红或蓝时，贴地 3.5 cm 以内的颜色点按高度丢掉，不靠把色相收窄来区分。
 
 # 贴地同色时，离地不足这条的点视为地面。侧面最底下贴着方块的一条留下。
@@ -117,9 +118,9 @@ def _cube_silhouette(
     zmax: float,
     pixel_scale: float = 1.0,
 ) -> np.ndarray | None:
-    # 绿线是方块在图像上的外沿。立方体的投影是凸的，所以最后填凸包，边是直的。
-    # 种子只用离地的严格颜色。面上深度稀的地方仍靠颜色补全，已知贴地的像素删掉，
-    # 搜索范围按边长在这一距离上占多少像素封住，轮廓就不会铺满画面。
+    # 绿线沿严格红蓝走。种子先要成片，再比地面长边谁更接近边长。
+    # 长边超过 2.5 倍边长的块丢掉之后，稀疏的线材补不上这个门槛，不能接替方块。
+    # 放宽颜色只填红蓝接缝那大约 10 px。再往外一个边长是上限，木板和机器人进不来。
     valid = _valid_depth(depth, zmin, zmax)
     ys, xs = np.nonzero(strict)
     if len(xs) < 3:
@@ -135,24 +136,36 @@ def _cube_silhouette(
         return None
     elev = np.zeros(strict.shape, dtype=np.uint8)
     elev[ys[good][elevated], xs[good][elevated]] = 255
-    # 同一面上的几个深度点并成一块。地面不是离地点，不会因此和方块并到一起。
-    link_px = _scaled_odd(15, pixel_scale)
-    blob = cv2.dilate(elev, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (link_px, link_px)))
+    height_img = np.full(strict.shape, np.nan, dtype=float)
+    height_img[ys[good], xs[good]] = height
+    # 只跨过红蓝接缝。核再大就会把旁边的台面并进同一块，长边被判超限后方块种子消失。
+    seam_px = _scaled_odd(11, pixel_scale)
+    seam_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seam_px, seam_px))
+    blob = cv2.dilate(elev, seam_kernel)
     count, labels = cv2.connectedComponents(blob, connectivity=8)
-    best_rank: tuple[float, float, float] | None = None
+    best_rank: tuple[float, float] | None = None
     best_seed: np.ndarray | None = None
     for lab in range(1, count):
         seed = (labels == lab) & (elev > 0)
         n_seed = int(seed.sum())
         if n_seed < 3:
             continue
-        long_side = _span_long_side(seed.astype(np.uint8) * 255, depth, intr, plane)
-        if long_side is not None and long_side > cube_size * 2.5:
+        z_med = float(np.median(depth[seed]))
+        if not np.isfinite(z_med) or z_med <= 1e-3:
             continue
-        if long_side is None:
-            rank = (1.0, 0.0, -float(n_seed))
-        else:
-            rank = (0.0, abs(long_side - cube_size), -float(n_seed))
+        edge_px = cube_size * float(intr.fx) / z_med
+        min_solid = max(int(round(40 * pixel_scale)), int(0.08 * edge_px * edge_px))
+        if n_seed < min_solid:
+            continue
+        sy, sx = np.nonzero(seed)
+        box = (int(sx.max()) - int(sx.min()) + 1) * (int(sy.max()) - int(sy.min()) + 1)
+        # 线材铺开时长边也能接近边长，像素占不满外接框，先丢掉。
+        if n_seed < 0.12 * box:
+            continue
+        long_side = _span_long_side(seed.astype(np.uint8) * 255, depth, intr, plane)
+        if long_side is None or long_side > cube_size * 2.5:
+            continue
+        rank = (abs(long_side - cube_size), -float(n_seed))
         if best_rank is None or rank < best_rank:
             best_rank = rank
             best_seed = seed
@@ -161,76 +174,47 @@ def _cube_silhouette(
     z_med = float(np.median(depth[best_seed]))
     if not np.isfinite(z_med) or z_med <= 1e-3:
         return None
+    # 搜索半径是一个边长，不再乘 2.2。接缝核比这个更紧，实际只往外补大约 10 px。
     reach = float(np.clip(cube_size * float(intr.fx) / z_med, 12.0 * pixel_scale, 420.0 * pixel_scale))
     inv = np.where(best_seed, np.uint8(0), np.uint8(255))
     dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-    window = dist <= (2.2 * reach)
-    color = (loose > 0) & window
-    # 红蓝接缝大约十个像素。只用来把两半连成同一块，凸包的顶点仍是原来的颜色像素。
-    link = cv2.dilate(
-        color.astype(np.uint8) * 255,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (link_px, link_px)),
-    )
-    link = (link > 0) & window
-    n_link, link_labels = cv2.connectedComponents(link.astype(np.uint8), connectivity=8)
-    touch = np.unique(link_labels[best_seed])
-    keep_label = np.zeros(n_link, dtype=bool)
-    keep_label[touch] = True
-    keep_label[0] = False
-    chosen = keep_label[link_labels] & color
-    ys2, xs2 = np.nonzero(chosen)
-    if len(xs2) < 3:
-        return None
-    z2 = depth[ys2, xs2]
-    good2 = valid[ys2, xs2]
-    measured = np.full(len(xs2), np.nan)
-    if int(good2.sum()) >= 3:
-        pts = deproject_pixels(np.column_stack([xs2[good2], ys2[good2]]), z2[good2], intr)
-        measured[good2] = plane.signed_distance(pts)
-    body_h = (measured > GROUND_CLEARANCE_M) & (measured < cube_size + 0.08)
-    if int(body_h.sum()) < 3:
-        return None
-    body = np.zeros(strict.shape, dtype=np.uint8)
-    body[ys2[body_h], xs2[body_h]] = 255
+    window = dist <= reach
     radius = int(np.ceil(GROUND_CLEARANCE_M * float(intr.fx) / z_med))
     radius = int(np.clip(radius, max(2, int(round(4 * pixel_scale))), max(4, int(round(20 * pixel_scale)))))
-    near = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)))
-    contact = good2 & (measured > -0.02) & (measured <= GROUND_CLEARANCE_M) & (near[ys2, xs2] > 0)
-    ground = np.zeros(strict.shape, dtype=np.uint8)
-    on_ground = good2 & (measured <= GROUND_CLEARANCE_M) & ~contact
-    if int(on_ground.sum()) > 0:
-        ground[ys2[on_ground], xs2[on_ground]] = 255
-    ground_px = _scaled_odd(5, pixel_scale)
-    ground_near = cv2.dilate(ground, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ground_px, ground_px)))
-    unknown = ~good2
-    # 没有深度的面留在颜色块里。紧挨已知地面的空洞是地面本身，不拿来撑外沿。
-    keep_px = body_h | contact | (unknown & (ground_near[ys2, xs2] == 0))
-    survive = np.zeros(strict.shape, dtype=np.uint8)
-    survive[ys2[keep_px], xs2[keep_px]] = 255
-    n_sur, sur_labels = cv2.connectedComponents(survive, connectivity=8)
-    body_labs = np.unique(sur_labels[body > 0])
-    keep_sur = np.zeros(n_sur, dtype=bool)
-    keep_sur[body_labs] = True
-    keep_sur[0] = False
-    survive = np.where(keep_sur[sur_labels], np.uint8(255), np.uint8(0))
-    sy, sx = np.nonzero(body)
-    cx = float(np.median(sx))
-    cy = float(np.median(sy))
-    yy, xx = np.nonzero(survive)
-    if len(xx) < 3:
-        return None
-    cap = 1.9 * reach
-    inside = (xx - cx) ** 2 + (yy - cy) ** 2 <= cap * cap
-    if int(inside.sum()) < 3:
-        return None
-    pts_px = np.column_stack([xx[inside], yy[inside]]).astype(np.int32)
-    hull = cv2.convexHull(pts_px)
-    peri = float(cv2.arcLength(hull, True))
-    approx = cv2.approxPolyDP(hull, max(2.0 * pixel_scale, 0.012 * peri), True)
-    if len(approx) >= 3:
-        hull = cv2.convexHull(approx)
+    near = cv2.dilate(
+        best_seed.astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)),
+    )
+    contact = (
+        (strict > 0)
+        & np.isfinite(height_img)
+        & (height_img > -0.02)
+        & (height_img <= GROUND_CLEARANCE_M)
+        & (near > 0)
+        & window
+    )
+    seam_band = cv2.dilate(best_seed.astype(np.uint8) * 255, seam_kernel)
+    bridge_px = (loose > 0) & (seam_band > 0) & window & valid & ~best_seed
+    bridge = np.zeros(strict.shape, dtype=bool)
+    by, bx = np.nonzero(bridge_px)
+    if len(bx) > 0:
+        bz = depth[by, bx]
+        bpts = deproject_pixels(np.column_stack([bx, by]), bz, intr)
+        bheight = plane.signed_distance(bpts)
+        keep = (bheight > GROUND_CLEARANCE_M) & (bheight < cube_size + 0.08)
+        bridge[by[keep], bx[keep]] = True
     mask = np.zeros(strict.shape, dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull, 255)
+    mask[best_seed | contact | bridge] = 255
+    # 接缝上没进放宽颜色的缝用闭运算补上。补上的像素仍限制在一个边长以内。
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, seam_kernel)
+    mask = cv2.bitwise_and(mask, window.astype(np.uint8) * 255)
+    # 凸包的顶点只来自这块方块。斜视时顶面内部被补上，旁边的木板不是顶点，进不了掩膜。
+    yy, xx = np.nonzero(mask)
+    if len(xx) >= 3:
+        hull = cv2.convexHull(np.column_stack([xx, yy]).astype(np.int32))
+        filled = np.zeros(strict.shape, dtype=np.uint8)
+        cv2.fillConvexPoly(filled, hull, 255)
+        mask = filled
     return mask
 
 
@@ -398,7 +382,7 @@ def _mask_from_plane(
     zmax: float,
     pixel_scale: float,
 ):
-    # 半分辨率上先分出凸外沿，再最近邻放大回深度图。像素计数仍按放大后的掩膜。
+    # 半分辨率上先分出颜色外沿，再最近邻放大回深度图。像素计数仍按放大后的掩膜。
     if pixel_scale < 0.99:
         color, depth_s, intr_s, pixel_scale = _half_view(color_bgr, depth, intr)
     else:
@@ -429,7 +413,7 @@ def prepare_mask(
     intr=None,
     cube_size: float = 0.2,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    # 有地面时，绿线取方块颜色区域的凸外沿。红面或蓝面在上走同一条路径。
+    # 有地面时，绿线取成片严格红蓝的外沿。红面或蓝面在上走同一条路径。
     # 先在半分辨率上找轮廓。找不到再回到全分辨率，平台挪动后的第一帧仍能找回方块。
     if plane is not None and intr is not None:
         if min(color_bgr.shape[:2]) >= 8:
@@ -621,7 +605,8 @@ def detect_visible_cube(
         return None
 
     # 1. 颜色点是否够多，并且贴在地面以上、高度接近方块边长。
-    # 足迹只投接近顶面的一层。侧面留在掩膜里，不参与矩形。
+    # 足迹只投掩膜里接近顶面的那一层。侧面和落地边留在掩膜里，不参与矩形。
+    # 掩膜之外的木台即使高度差不多，也不会被投到这个矩形上。
     packed = _mask_points(
         color_bgr, depth, intr, colors, zmin, zmax, plane, cube_size, prepared=prepared
     )

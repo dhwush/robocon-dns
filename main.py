@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from camera.source import Frame, RealSenseSource, filter_depth
+from camera.source import Frame, RealSenseSource, color_lock_from_config, filter_depth, list_camera_serials
 from cube.detect import calibrate_hsv, detect_visible_cube, prepare_mask
 from field.extrinsic import (
     calibrate_from_image,
@@ -28,7 +28,7 @@ from field.extrinsic import (
 )
 from field.motion import MotionTracker
 from fuse.median import average_scores, fuse_poses, score_trial
-from geom.transform import camera_to_world, load_intrinsics
+from geom.transform import camera_to_world, load_intrinsics, load_intrinsics_for_serial
 from ground.plane import fit_ground, plane_holds, sample_points
 
 # --- 单帧估计 -----------------------------------------------------------------
@@ -405,9 +405,40 @@ def _field_pose(color, intr, cfg, plane):
     return calibrate_from_image(color, intr, plane, cfg["field_length"], cfg["field_width"])
 
 
-def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool, debug: bool) -> None:
+def live_intrinsics(serial: str | None = None):
+    # 没接相机时不猜一台。接了一台就用它的序列号。接了多台必须指明号码。
+    if serial is None:
+        found = list_camera_serials()
+        if not found:
+            raise SystemExit("没有接上相机，不能按序列号选择内参")
+        if len(found) > 1:
+            raise SystemExit("接了多台相机，请用 --serial 指定: " + ", ".join(found))
+        serial = found[0]
+    try:
+        intr = load_intrinsics_for_serial(str(serial))
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    return str(serial), intr
+
+
+def run_live(
+    cfg: dict,
+    intr,
+    mode: str,
+    calibrate: bool,
+    calibrate_color: bool,
+    debug: bool,
+    serial: str | None = None,
+    color_lock: dict | None = None,
+) -> None:
     # 实机循环。标定分支写完文件就返回；正常分支凑满样本后按 output_hz 打印 JSON。
-    source = RealSenseSource(intr.width, intr.height, fps=int(cfg.get("fps", 30)))
+    source = RealSenseSource(
+        intr.width,
+        intr.height,
+        fps=int(cfg.get("fps", 30)),
+        serial=serial,
+        color_lock=color_lock,
+    )
     rotation, translation = identity_extrinsic()
     tracker = None
     if mode == "field" and not calibrate:
@@ -563,10 +594,12 @@ def main() -> None:
     # --self-check 不打开相机。其余路径读取配置内参后进入实机循环。
     parser = argparse.ArgumentParser(description="Cube world pose from a D435i")
     parser.add_argument("--config", default="config/default.yaml")
-    parser.add_argument("--intrinsics", default="config/intrinsics.yaml")
+    parser.add_argument("--serial", default=None, help="接了多台相机时指定序列号")
+    parser.add_argument("--intrinsics", default=None, help="不用序列号表，改读这一份内参文件")
     parser.add_argument("--mode", choices=("basic", "field"), default=None)
     parser.add_argument("--calibrate", action="store_true")
     parser.add_argument("--calibrate-color", action="store_true")
+    parser.add_argument("--light", default=None, help="亮度档：bright、daylight、indoor、dim、dark")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
@@ -574,8 +607,21 @@ def main() -> None:
     mode = args.mode or cfg.get("mode", "basic")
     if args.self_check:
         raise SystemExit(self_check(cfg))
-    intr = load_intrinsics(args.intrinsics)
-    run_live(cfg, intr, mode, args.calibrate, args.calibrate_color, args.debug)
+    if args.intrinsics:
+        serial, intr = None, load_intrinsics(args.intrinsics)
+    else:
+        serial, intr = live_intrinsics(args.serial)
+    color_lock = color_lock_from_config(cfg, args.light)
+    run_live(
+        cfg,
+        intr,
+        mode,
+        args.calibrate,
+        args.calibrate_color,
+        args.debug,
+        serial=serial,
+        color_lock=color_lock,
+    )
 
 
 if __name__ == "__main__":

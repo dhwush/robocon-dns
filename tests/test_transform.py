@@ -11,6 +11,7 @@ from geom.transform import (
     compose_R,
     deproject_pixels,
     load_intrinsics,
+    load_intrinsics_for_serial,
     project_linear,
     project_points,
     world_to_camera,
@@ -80,6 +81,24 @@ def test_linear_matrix_matches_pinhole_when_no_distortion():
     by_matrix = project_linear(world, intr, rotation, translation)
     by_pinhole = project_points(cam, intr)
     np.testing.assert_allclose(by_matrix, by_pinhole, atol=1e-9)
+
+
+def test_intrinsics_follow_camera_serial():
+    """四台相机各用自己的彩色内参。没接相机时按序列号查表，表外的号码不借用另一台。"""
+    current = load_intrinsics_for_serial("244622071936")
+    assert current.width == 1280
+    assert abs(current.fx - 909.7513) < 1e-9
+    assert abs(current.cy - 376.0774) < 1e-9
+    other = load_intrinsics_for_serial("043322075459")
+    assert abs(other.fx - 912.2286) < 1e-9
+    assert abs(other.cx - 636.9600) < 1e-9
+    assert abs(load_intrinsics_for_serial("213622078104").cy - 373.4455) < 1e-9
+    assert abs(load_intrinsics_for_serial("244222071048").cx - 630.7516) < 1e-9
+    try:
+        load_intrinsics_for_serial("000000000000")
+    except KeyError:
+        return
+    raise AssertionError("unknown serial should not fall back to another camera")
 
 
 def test_config_intrinsics_are_the_only_source():

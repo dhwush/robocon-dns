@@ -1,6 +1,7 @@
-"""按公布的 D435i 彩色模型渲染考试用场景。
+"""按彩色相机序列号渲染考试用场景。
 
 彩色是 8 位 BGR PNG。深度是 16 位 PNG，单位毫米，0 表示没有深度。
+没有接相机时用 EXAM_SERIAL 这台的表内内参。实机接上后按设备序列号另选。
 """
 
 from __future__ import annotations
@@ -10,12 +11,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from geom.transform import deproject_pixels, project_points, world_to_camera
+from geom.transform import deproject_pixels, load_intrinsics_for_serial, project_points, world_to_camera
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENE_DIR = ROOT / "tests" / "output" / "scenes"
 VIS_DIR = ROOT / "tests" / "output" / "vis"
-INTRINSICS_PATH = ROOT / "config" / "d435i_1280x720.yaml"
+# 考试图不打开相机。这台是表里的一台，渲染和评分用同一组彩色内参。
+EXAM_SERIAL = "244622071936"
 
 GROUND_BGR = (170, 170, 170)
 BLUE_BGR = (255, 40, 40)

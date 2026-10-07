@@ -23,6 +23,15 @@ output_hz: 10
 hold_s: 0.5
 jump_m: 0.03
 fps: 30
+# 自动曝光关闭。按环境选一档，亮处压曝光以免红蓝冲白，暗处再抬曝光、增益和亮度偏移。
+# 曝光单位是微秒。超出相机允许范围时会夹到设备上下限。
+light: daylight
+light_levels:
+  bright: {exposure: 25, gain: 0, brightness: -16}
+  daylight: {exposure: 50, gain: 16, brightness: 0}
+  indoor: {exposure: 150, gain: 28, brightness: 0}
+  dim: {exposure: 400, gain: 48, brightness: 12}
+  dark: {exposure: 1200, gain: 72, brightness: 24}
 hsv_calib_frames: 30
 hsv_path: config/hsv.yaml
 extrinsic_path: config/extrinsic.yaml
