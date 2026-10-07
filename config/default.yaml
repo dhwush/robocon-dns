@@ -12,9 +12,10 @@ ground_ransac_iterations: 50
 ground_stride: 8
 ground_max_angle_deg: 8.0
 min_face_pixels: 400
-# 足迹面积低于这个比例就丢帧。长边另有 12% 相对上限，短边短于 0.45 倍边长也丢帧。
+# 足迹面积低于这个比例就丢帧。近处长边按 24 mm，更远按 max(24 mm, 0.02*z) 且不超过 size_tolerance。
+# 短边短于 0.45 倍边长也丢帧。
 min_footprint_fraction: 0.45
-# 长边门限是 min(这个值, 0.12 * cube_size)。0.06 m 仍大于 0.2 m 的 12%，长边继续按 12% 丢帧；
+# 长边门限是 min(这个值, max(0.12 * cube_size, 0.02*z))。近处仍是 24 mm，2 m 约 4 cm，3 m 约 6 cm。
 # 高度检查用的是这个值再加 5 cm，不能再留 0.18 m，否则比边长还宽。
 size_tolerance: 0.06
 frames_to_fuse: 15
