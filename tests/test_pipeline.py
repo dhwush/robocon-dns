@@ -100,7 +100,7 @@ def test_visible_cube_pose_within_tolerance():
 
 
 def test_dim_cube_on_red_and_blue_ground():
-    """地面半边暗红、半边暗蓝。方块用够饱和的红，底面中心仍要落在方块上，不能铺到地面。"""
+    """地面半边暗红、半边暗蓝，方块本身也偏暗。底面中心仍要落在方块上，不能铺到地面。"""
     intr = intrinsics_for(320, 240)
     center = np.array([0.08, 0.06, 0.7])
     yaw = 0.35
@@ -121,7 +121,7 @@ def test_dim_cube_on_red_and_blue_ground():
     right = ground.copy()
     right[:, : intr.width // 2] = False
     color[right] = (30, 25, 55)
-    color[cube] = (40, 40, 220)
+    color[cube] = (30, 25, 55)
     depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
     from ground.plane import sample_points
 
