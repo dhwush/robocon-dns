@@ -16,7 +16,7 @@ import numpy as np
 from camera.source import RealSenseSource, filter_depth
 from cube.detect import detect_visible_cube, prepare_mask
 from geom.transform import deproject_pixels, load_intrinsics, project_points
-from ground.plane import fit_ground, sample_points
+from ground.plane import fit_ground, plane_holds, sample_points
 from main import load_config
 
 
@@ -80,18 +80,28 @@ def main() -> None:
     height = float(cfg["cube_size"])
     last = time.monotonic()
     fps = 0.0
+    held_plane = None
+    stride = int(cfg.get("ground_stride", 8))
+    thresh = float(cfg["ground_ransac_thresh"])
+    max_angle = float(cfg["ground_max_angle_deg"])
+    iterations = int(cfg.get("ground_ransac_iterations", 50))
     try:
         while True:
             frame = source.read()
             depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
             gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
-            plane = fit_ground(
-                sample_points(depth, intr, stride=4),
-                gravity,
-                thresh=float(cfg["ground_ransac_thresh"]),
-                max_angle_deg=float(cfg["ground_max_angle_deg"]),
-                iterations=int(cfg.get("ground_ransac_iterations", 80)),
-            )
+            cloud = sample_points(depth, intr, stride=stride)
+            if held_plane is not None and plane_holds(cloud, held_plane, gravity, thresh, max_angle):
+                plane = held_plane
+            else:
+                plane = fit_ground(
+                    cloud,
+                    gravity,
+                    thresh=thresh,
+                    max_angle_deg=max_angle,
+                    iterations=iterations,
+                )
+            held_plane = plane
             vis = frame.color.copy()
             prepared = None
             if plane is not None:

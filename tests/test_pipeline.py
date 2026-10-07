@@ -251,12 +251,11 @@ def test_face_fallback_on_single_face():
     yaw = 0.25
     color, depth = _render_front_face(intr, rotation, translation, center, yaw)
     gravity = rotation @ np.array([0.0, 0.0, -1.0])
-    frame = Frame(color, depth, gravity)
+    depth_f = filter_depth(depth, 0.3, 3.0, 0.08)
+    frame = Frame(color, depth_f, gravity)
     basic = estimate_frame(frame, intr, cfg, rotation, translation)
     assert basic is None
     from ground.plane import sample_points
-
-    depth_f = filter_depth(depth, 0.3, 3.0, 0.08)
     plane = fit_ground(sample_points(depth_f, intr, stride=2), gravity)
     assert plane is not None
     pose = fit_when_face_missing(

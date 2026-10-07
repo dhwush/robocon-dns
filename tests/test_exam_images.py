@@ -188,9 +188,12 @@ def _read_gt(name: str) -> dict:
         return json.load(handle)
 
 
-def _frame(name: str, gravity: np.ndarray) -> Frame:
+def _frame(name: str, gravity: np.ndarray, cfg: dict | None = None) -> Frame:
     # 把存盘的彩色和深度装成与实机相同的 Frame，重力由机位决定。
+    # 估计前先洗深度，和实机循环把清洗留在循环里的做法一致。
     color, depth = load_rgbd(SCENE_DIR, name)
+    if cfg is not None:
+        depth = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
     return Frame(color, depth, gravity)
 
 
@@ -301,10 +304,11 @@ def _fit_plane(frame: Frame, intr, cfg):
     depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
     gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
     return fit_ground(
-        sample_points(depth, intr, stride=4),
+        sample_points(depth, intr, stride=int(cfg.get("ground_stride", 8))),
         gravity,
         thresh=float(cfg["ground_ransac_thresh"]),
         max_angle_deg=float(cfg["ground_max_angle_deg"]),
+        iterations=int(cfg.get("ground_ransac_iterations", 50)),
     )
 
 
@@ -320,7 +324,7 @@ def test_exam_images_match_assignment():
     identity_t = np.zeros(3)
     for case in basic_cases():
         gt = _read_gt(case["name"])
-        est = estimate_frame(_frame(case["name"], gravity), intr, cfg, identity_r, identity_t)
+        est = estimate_frame(_frame(case["name"], gravity, cfg), intr, cfg, identity_r, identity_t)
         trial = _score_pose(est, gt)
         basic_trials.append(trial)
         _basic_overlay(intr, case["name"], gt, trial)
@@ -350,7 +354,7 @@ def test_exam_images_match_assignment():
         for index in range(3):
             name = f"{station['name']}_cube_{index}"
             gt = _read_gt(name)
-            est = estimate_frame(_frame(name, gravity_cam), intr, cfg, rotation, translation)
+            est = estimate_frame(_frame(name, gravity_cam, cfg), intr, cfg, rotation, translation)
             trial = _score_pose(est, gt)
             station_trials.append(trial)
             advanced_trials.append(trial)

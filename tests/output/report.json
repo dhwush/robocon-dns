@@ -6,28 +6,28 @@
     "basic_passed": true
   },
   "advanced": {
-    "position": 4.0,
-    "yaw": 4.0,
-    "total": 8.0,
-    "basic_passed": true
+    "position": 3.111111111111111,
+    "yaw": 3.111111111111111,
+    "total": 6.222222222222222,
+    "basic_passed": false
   },
   "stations": [
     {
       "name": "station_0",
       "summary": {
-        "position": 4.0,
-        "yaw": 4.0,
-        "total": 8.0,
-        "basic_passed": true
+        "position": 2.6666666666666665,
+        "yaw": 2.6666666666666665,
+        "total": 5.333333333333333,
+        "basic_passed": false
       }
     },
     {
       "name": "station_1",
       "summary": {
-        "position": 4.0,
-        "yaw": 4.0,
-        "total": 8.0,
-        "basic_passed": true
+        "position": 2.6666666666666665,
+        "yaw": 2.6666666666666665,
+        "total": 5.333333333333333,
+        "basic_passed": false
       }
     },
     {

@@ -29,7 +29,7 @@ from field.extrinsic import (
 from field.motion import MotionTracker
 from fuse.median import average_scores, fuse_poses, score_trial
 from geom.transform import camera_to_world, load_intrinsics
-from ground.plane import fit_ground, sample_points
+from ground.plane import fit_ground, plane_holds, sample_points
 
 # --- 单帧估计 -----------------------------------------------------------------
 # 深度清洗 → 地面 → 可见面位姿 →（可选）看不清面时的补救 → 变到世界系。
@@ -83,6 +83,37 @@ def pose_to_world(pose, rotation: np.ndarray, translation: np.ndarray, plane, he
     }
 
 
+_UNSET = object()
+
+
+def _clean_frame(color: np.ndarray, depth: np.ndarray, gravity: np.ndarray, cfg: dict) -> Frame:
+    # 深度只洗这一次。估计函数不再洗第二遍。
+    cleaned = filter_depth(
+        depth,
+        zmin=float(cfg["depth_min"]),
+        zmax=float(cfg["depth_max"]),
+        flying_pixel_m=float(cfg["flying_pixel_m"]),
+    )
+    return Frame(color, cleaned, gravity)
+
+
+def _acquire_plane(depth: np.ndarray, intr, cfg: dict, gravity: np.ndarray, held):
+    # 上一帧平面仍满足夹角和内点比例就沿用。否则按配置步长重新 RANSAC。
+    stride = int(cfg.get("ground_stride", 8))
+    thresh = float(cfg["ground_ransac_thresh"])
+    max_angle = float(cfg["ground_max_angle_deg"])
+    cloud = sample_points(depth, intr, stride=stride)
+    if held is not None and plane_holds(cloud, held, gravity, thresh, max_angle):
+        return held
+    return fit_ground(
+        cloud,
+        gravity,
+        thresh=thresh,
+        max_angle_deg=max_angle,
+        iterations=int(cfg.get("ground_ransac_iterations", 50)),
+    )
+
+
 def estimate_frame(
     frame: Frame,
     intr,
@@ -91,23 +122,14 @@ def estimate_frame(
     translation: np.ndarray,
     rejects: dict | None = None,
     initial_up: np.ndarray | None = None,
+    plane=_UNSET,
 ):
-    # 深度先清洗。没有 IMU 时按俯视自检的约定，重力沿相机 +Z。有加速度计就用实测重力，不假设光轴朝向。
-    depth = filter_depth(
-        frame.depth,
-        zmin=float(cfg["depth_min"]),
-        zmax=float(cfg["depth_max"]),
-        flying_pixel_m=float(cfg["flying_pixel_m"]),
-    )
-    gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
-    cloud = sample_points(depth, intr, stride=4)
-    plane = fit_ground(
-        cloud,
-        gravity,
-        thresh=float(cfg["ground_ransac_thresh"]),
-        max_angle_deg=float(cfg["ground_max_angle_deg"]),
-        iterations=int(cfg.get("ground_ransac_iterations", 80)),
-    )
+    # 调用方传入已经洗过的深度。没有 IMU 时按俯视自检的约定，重力沿相机 +Z。
+    # plane 已由实机循环拟合过时直接用，避免一帧拟合两次。
+    depth = frame.depth
+    if plane is _UNSET:
+        gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
+        plane = _acquire_plane(depth, intr, cfg, gravity, None)
     # 地面没拟合上就整帧作废，避免在错误平面上给出 yaw。
     if plane is None:
         _bump(rejects, "ground")
@@ -184,8 +206,8 @@ def self_check(cfg: dict) -> int:
             top_bgr=(255, 80, 40),
         )
         samples = []
-        for _ in range(int(cfg.get("min_samples", 8))):
-            sample = estimate_frame(Frame(color, depth, gravity), intr, cfg, rotation, translation)
+        for _ in range(int(cfg.get("min_samples", 5))):
+            sample = estimate_frame(_clean_frame(color, depth, gravity, cfg), intr, cfg, rotation, translation)
             if sample is not None:
                 samples.append(sample)
         fused = fuse_poses(samples)
@@ -261,7 +283,7 @@ def self_check(cfg: dict) -> int:
             color, depth = render_cube_in_world(
                 intr, rotation, translation, center, yaw, size=float(cfg["cube_size"])
             )
-            sample = estimate_frame(Frame(color, depth, gravity_cam), intr, cfg, est_r, est_t)
+            sample = estimate_frame(_clean_frame(color, depth, gravity_cam, cfg), intr, cfg, est_r, est_t)
             if sample is None:
                 advanced.append({"position_score": 0, "yaw_score": 0, "position_error": 1.0, "yaw_error": 1.0})
                 print(f"  cube rejected gt={center[:2]}")
@@ -372,18 +394,12 @@ def _show_debug(color: np.ndarray, depth: np.ndarray, cfg: dict, record: dict, i
 # --- 实机循环 -----------------------------------------------------------------
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
 # field 模式从起步相机跟踪：场地边能看见就校正，看不见就用视觉，视觉也失败再靠陀螺仪，超过 track_hold_s 停止输出。
-# 合格样本满 8 帧才输出 JSON。地面或外参平移跳过 30 mm 时清空缓冲。
+# 合格样本满 min_samples 帧才输出 JSON。地面或外参平移跳过 30 mm 时清空缓冲。
 # 失败后 0.5 s 内重复上一结果，再失败则输出空对象。丢帧原因累加后写到标准错误。
 
-def _field_pose(color, depth, intr, cfg, gravity):
+def _field_pose(color, intr, cfg, plane):
     # 边不在画面里就返回空，调用方改走陀螺仪和视觉跟踪，不把这一帧判成标定失败。
-    plane = fit_ground(
-        sample_points(depth, intr),
-        gravity,
-        thresh=float(cfg["ground_ransac_thresh"]),
-        max_angle_deg=float(cfg["ground_max_angle_deg"]),
-        iterations=int(cfg.get("ground_ransac_iterations", 80)),
-    )
+    # 地面和方块检测共用这一帧已经拟合好的平面。
     if plane is None:
         return None
     return calibrate_from_image(color, intr, plane, cfg["field_length"], cfg["field_width"])
@@ -412,7 +428,8 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
     last_tick: float | None = None
     hold_s = float(cfg.get("hold_s", 0.5))
     jump_m = float(cfg.get("jump_m", 0.03))
-    min_samples = int(cfg.get("min_samples", 8))
+    min_samples = int(cfg.get("min_samples", 5))
+    held_plane = None
     window = int(cfg.get("frames_to_fuse", 15))
     output_period = 1.0 / float(cfg.get("output_hz", 10))
     try:
@@ -434,11 +451,11 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
                 # 没有加速度计时才用这个方向。图像向下当重力，只为场地边标定能拟合地面，不是 2.3 的旋转矩阵。
                 gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
                 plane = fit_ground(
-                    sample_points(depth, intr),
+                    sample_points(depth, intr, stride=int(cfg.get("ground_stride", 8))),
                     gravity,
                     thresh=float(cfg["ground_ransac_thresh"]),
                     max_angle_deg=float(cfg["ground_max_angle_deg"]),
-                    iterations=int(cfg.get("ground_ransac_iterations", 80)),
+                    iterations=int(cfg.get("ground_ransac_iterations", 50)),
                 )
                 if plane is None:
                     print("ground not found")
@@ -450,12 +467,18 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
                 save_extrinsic(cfg["extrinsic_path"], pose[0], pose[1])
                 print(f"saved extrinsic to {cfg['extrinsic_path']}")
                 return
+            frame = Frame(frame.color, depth, frame.gravity, frame.gyro)
             now = time.monotonic()
             dt = 0.0 if last_tick is None else now - last_tick
             last_tick = now
             initial_up = None
             if tracker is not None:
                 gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
+            else:
+                gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
+            plane = _acquire_plane(depth, intr, cfg, gravity, held_plane)
+            held_plane = plane
+            if tracker is not None:
                 up = None if frame.gravity is None else -frame.gravity
                 if not tracker.started:
                     tracker.start(frame.color, depth, up)
@@ -463,7 +486,7 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
                     tracker.begin_frame()
                     tracker.integrate_gyro(frame.gyro or [])
                     visual = tracker.observe_visual(frame.color, depth, intr)
-                    field_pose = _field_pose(frame.color, depth, intr, cfg, gravity)
+                    field_pose = _field_pose(frame.color, intr, cfg, plane)
                     if field_pose is not None:
                         tracker.observe_field(*field_pose)
                         tracker.note_locked()
@@ -479,11 +502,15 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
                     _bump(rejects, "track")
                     sample = None
                 else:
-                    sample = estimate_frame(frame, intr, cfg, rotation, translation, rejects, initial_up)
+                    sample = estimate_frame(
+                        frame, intr, cfg, rotation, translation, rejects, initial_up, plane
+                    )
                     if sample is not None:
                         sample["track"] = tracker.source
             else:
-                sample = estimate_frame(frame, intr, cfg, rotation, translation, rejects, initial_up)
+                sample = estimate_frame(
+                    frame, intr, cfg, rotation, translation, rejects, initial_up, plane
+                )
             corners = None if sample is None else sample.pop("corners_cam", None)
             origin = None if sample is None else np.asarray(sample.pop("plane_origin"), dtype=float)
             moved = False
@@ -498,6 +525,7 @@ def run_live(cfg: dict, intr, mode: str, calibrate: bool, calibrate_color: bool,
             if moved:
                 samples.clear()
                 last_record = None
+                held_plane = None
             if origin is not None:
                 last_plane = origin
             if translation is not None:

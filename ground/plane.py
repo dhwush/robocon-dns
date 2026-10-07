@@ -131,6 +131,25 @@ def fit_ground(
     return None
 
 
+def plane_holds(
+    points: np.ndarray,
+    plane: Plane,
+    gravity: np.ndarray,
+    thresh: float = 0.015,
+    max_angle_deg: float = 8.0,
+) -> bool:
+    # 上一帧平面还贴着这块点云、法向仍朝上时，直接沿用，不再抽点和 SVD。
+    # 夹角和内点比例与 fit_ground 相同。只看内点数会把已经拧斜的平面粘住。
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 3:
+        return False
+    _normal, _offset, angle = _orient_up(np.asarray(plane.normal, dtype=float), float(plane.offset), gravity)
+    if angle > max_angle_deg:
+        return False
+    count = int(np.count_nonzero(np.abs(pts @ plane.normal - plane.offset) < thresh))
+    return count >= max(30, int(0.05 * len(pts)))
+
+
 # --- 深度图抽样 ---------------------------------------------------------------
 # 按已知内参把像素反投影成相机系点，供地面拟合使用。stride 用来减点。
 

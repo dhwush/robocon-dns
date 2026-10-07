@@ -27,11 +27,12 @@ class Frame:
 # --- 深度清洗 -----------------------------------------------------------------
 # 先丢掉 0.3–3 m 以外的值，再去掉边缘飞点，最后做中值平滑。
 # 稀疏深度不做中值：用 0 填空洞再模糊会把有效点抹掉。
+# 缓冲用 float32。米级深度用不上双精度，720p 双精度每帧大约 7 MB。
 
 def clip_range(depth: np.ndarray, zmin: float, zmax: float) -> np.ndarray:
     # D435i 有效距离大约 0.3–3 m。更近的视差不可靠，更远的深度噪声按距离平方变大。
     # 非法值统一写成 NaN，后面的拟合会跳过它们。
-    out = np.array(depth, dtype=float, copy=True)
+    out = np.array(depth, dtype=np.float32, copy=True)
     invalid = ~np.isfinite(out) | (out < zmin) | (out > zmax) | (out <= 0.0)
     out[invalid] = np.nan
     return out
@@ -58,7 +59,7 @@ def remove_flying_pixels(depth: np.ndarray, thresh_m: float) -> np.ndarray:
     local_max = cv2.dilate(hi, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=-1.0e6)
     local_min = cv2.erode(lo, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=1.0e6)
     jump = ((local_max - local_min) > thresh_m) & (count >= 3)
-    out = np.array(depth, dtype=float, copy=True)
+    out = np.array(depth, dtype=np.float32, copy=True)
     out[jump] = np.nan
     return out
 
@@ -70,12 +71,12 @@ def median_smooth(depth: np.ndarray, ksize: int = 3) -> np.ndarray:
     finite = np.isfinite(depth)
     # 有效像素不到七成时，空洞会被 0 填上，中值会把真深度拉向 0。这种情况直接返回。
     if float(finite.mean()) < 0.7:
-        return np.array(depth, dtype=float, copy=True)
+        return np.array(depth, dtype=np.float32, copy=True)
     filled = np.where(finite, depth, 0.0).astype(np.float32)
     smooth = cv2.medianBlur(filled, ksize)
     # 窗口里有效像素不足一半的位置仍视为空洞。
     mask = cv2.blur(finite.astype(np.float32), (ksize, ksize))
-    out = smooth.astype(float)
+    out = smooth.astype(np.float32)
     out[mask < 0.5] = np.nan
     return out
 
@@ -91,7 +92,7 @@ class TemporalDepthFilter:
 
     def apply(self, depth: np.ndarray) -> np.ndarray:
         # 两帧都有效时做指数平均；当前帧是洞、上一帧有值时沿用上一帧补闪烁。
-        cur = np.array(depth, dtype=float, copy=True)
+        cur = np.array(depth, dtype=np.float32, copy=True)
         if self._state is None or self._state.shape != cur.shape:
             self._state = cur
             return cur.copy()
@@ -122,8 +123,9 @@ def filter_depth(
 
 
 # --- 实机取流 -----------------------------------------------------------------
-# 彩色与深度对齐。深度在视差域做空间边缘保持滤波和时间滤波。
-# 空洞填充会把背景拉进方块边缘，这里关掉。彩色曝光和白平衡锁定。
+# 彩色与深度对齐。深度只做时间滤波。视差域空间滤波在 720p 上每帧要几十毫秒以上，
+# 飞点和 3×3 中值已经在 filter_depth 里做，这里不再做一遍边缘保持。
+# 彩色曝光和白平衡锁定。
 # 加速度静止时指向“上”，重力取反方向，并旋到彩色相机坐标系。
 
 class RealSenseSource:
@@ -150,16 +152,9 @@ class RealSenseSource:
         self._accel_to_color = np.eye(3)
         self._gyro_ready = False
         self._video_ready = False
-        self.depth_scale = 0.001
-        # 对齐和滤波要在启动回调之前建好，否则第一帧进来时还没有这些对象。
+        self.depth_scale = np.float32(0.001)
+        # 对齐和时间滤波要在启动回调之前建好，否则第一帧进来时还没有这些对象。
         self.align = rs.align(rs.stream.color)
-        self.to_disp = rs.disparity_transform(True)
-        self.to_depth = rs.disparity_transform(False)
-        self.spatial = rs.spatial_filter()
-        try:
-            self.spatial.set_option(rs.option.holes_fill, 0)
-        except Exception:
-            pass
         self.temporal_rs = rs.temporal_filter()
         try:
             self.profile = self.pipeline.start(config, self._on_frame)
@@ -170,7 +165,7 @@ class RealSenseSource:
             config.disable_stream(rs.stream.gyro)
             self.profile = self.pipeline.start(config, self._on_frame)
             self._gyro_on = False
-        self.depth_scale = self.profile.get_device().first_depth_sensor().get_depth_scale()
+        self.depth_scale = np.float32(self.profile.get_device().first_depth_sensor().get_depth_scale())
         self._accel_to_color = self._accel_rotation()
         if self._gyro_on:
             self._gyro_to_color = self._motion_rotation(rs.stream.gyro)
@@ -212,10 +207,8 @@ class RealSenseSource:
             color_frame = aligned.get_color_frame()
             if not depth_frame or not color_frame:
                 return
-            filtered = self.to_depth.process(
-                self.temporal_rs.process(self.spatial.process(self.to_disp.process(depth_frame)))
-            )
-            depth = np.asanyarray(filtered.get_data()).astype(float) * self.depth_scale
+            filtered = self.temporal_rs.process(depth_frame)
+            depth = np.asanyarray(filtered.get_data()).astype(np.float32) * self.depth_scale
             color = np.asanyarray(color_frame.get_data()).copy()
             gravity = None
             # 对齐结果经常不带加速度。空帧对象不是 None，直接读会抛掉整帧彩色和深度。

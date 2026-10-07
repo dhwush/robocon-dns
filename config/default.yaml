@@ -7,7 +7,9 @@ depth_max: 3.0
 flying_pixel_m: 0.08
 # 地面 RANSAC。方块投影到这块地面上，不另拟合上表面，因此不算顶面 RMS、12° 法向和 6 mm 残差。
 ground_ransac_thresh: 0.008
-ground_ransac_iterations: 80
+ground_ransac_iterations: 50
+# 地面是大平面。步长 8 大约 1.4 万点，够判断 8° 夹角和 5% 内点。
+ground_stride: 8
 ground_max_angle_deg: 8.0
 min_face_pixels: 400
 # 足迹面积低于这个比例就丢帧。长边另有 12% 相对上限，短边短于 0.45 倍边长也丢帧。
@@ -16,7 +18,7 @@ min_footprint_fraction: 0.45
 # 高度检查用的是这个值再加 5 cm，不能再留 0.18 m，否则比边长还宽。
 size_tolerance: 0.06
 frames_to_fuse: 15
-min_samples: 8
+min_samples: 5
 output_hz: 10
 hold_s: 0.5
 jump_m: 0.03
