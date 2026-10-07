@@ -252,8 +252,19 @@ class RealSenseSource:
         with self._lock:
             self._gyro.append((float(motion.timestamp) * 1e-3, omega))
 
+    def _set_clamped(self, sensor, option, value: float) -> None:
+        # 不同固件的上下限不一样。超出范围就夹到设备允许的值，避免设置失败把整路取流打断。
+        if not sensor.supports(option):
+            return
+        try:
+            span = sensor.get_option_range(option)
+            sensor.set_option(option, float(np.clip(value, span.min, span.max)))
+        except Exception:
+            return
+
     def _lock_color(self) -> None:
         # 自动曝光在平台移动时会连跳，颜色阈值跟着漂。锁定曝光和白平衡。
+        # 关掉自动后若留着默认曝光和增益，白天会把红蓝冲成接近白色。
         rs = self._rs
         try:
             sensor = self.profile.get_device().first_color_sensor()
@@ -261,6 +272,9 @@ class RealSenseSource:
             return
         if sensor.supports(rs.option.enable_auto_exposure):
             sensor.set_option(rs.option.enable_auto_exposure, 0)
+        self._set_clamped(sensor, rs.option.exposure, 50)
+        self._set_clamped(sensor, rs.option.gain, 16)
+        self._set_clamped(sensor, rs.option.brightness, 0)
         if sensor.supports(rs.option.enable_auto_white_balance):
             sensor.set_option(rs.option.enable_auto_white_balance, 0)
 
