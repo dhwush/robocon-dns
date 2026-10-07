@@ -45,14 +45,14 @@ enable_face_fallback: false
 # 方块上半纯红、下半纯蓝，分界绕四周，不是某一面的朝向标记。两色都进掩膜，都不标 front。
 colors:
   - name: red
-    hsv_low: [0, 80, 60]
-    hsv_high: [10, 255, 255]
+    hsv_low: [0, 110, 80]
+    hsv_high: [8, 255, 255]
     front: false
   - name: red_high
-    hsv_low: [170, 80, 60]
+    hsv_low: [172, 110, 80]
     hsv_high: [180, 255, 255]
     front: false
   - name: blue
-    hsv_low: [100, 80, 60]
+    hsv_low: [100, 80, 50]
     hsv_high: [130, 255, 255]
     front: false

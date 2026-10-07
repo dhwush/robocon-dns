@@ -32,7 +32,7 @@ class CubePose:
 
 # --- 颜色分割 -----------------------------------------------------------------
 # 红色在色相环两端，配置里写成两段再并起来。方块上下两半是红和蓝，哪一面在上都可以。
-# 绿线只描成片的严格红蓝。放宽颜色只补大约 10 px 的接缝，搜索不超过一个边长。
+# 绿线只描成片的严格红蓝，阈值按配置走，不随整幅亮度放宽。放宽颜色只补大约 10 px 的接缝。
 # 没有深度的点不拿来撑外沿，凸包也不把方块和旁边木板之间的地面填进掩膜。
 # 地面漆成红或蓝时，贴地 3.5 cm 以内的颜色点按高度丢掉，不靠把色相收窄来区分。
 
@@ -41,16 +41,6 @@ GROUND_CLEARANCE_M = 0.035
 
 # 足迹只收实测顶面往下这一条以内的点。再宽就会带上正面上沿，矩形被拉向相机。
 TOP_LAYER_BELOW_PEAK_M = 0.010
-
-
-def _scale_for_dim_light(hsv: np.ndarray) -> float:
-    # 整幅中值亮度低于约 110 时，按比例放宽饱和度和亮度下限，暗处的红蓝仍能进掩膜。
-    # 不再低于颜色函数里的保底，灰地面饱和度接近 0，不会因此被收进来。
-    sample = hsv[::8, ::8, 2]
-    if sample.size == 0:
-        return 1.0
-    median_v = float(np.median(sample))
-    return float(np.clip(median_v / 110.0, 0.45, 1.0))
 
 
 def _hue_range(hsv: np.ndarray, spec: dict, s_low: int, v_low: int, v_high: int = 255) -> np.ndarray:
@@ -73,24 +63,22 @@ def _scaled_odd(full_px: int, scale: float) -> int:
 def _color_layers(
     color_bgr: np.ndarray, colors: list[dict], pixel_scale: float = 1.0
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # 严格颜色用来认出方块在哪。放宽的只放松饱和度和亮度，色相仍是配置里的红和蓝。
-    # 不在这里做大范围闭运算，否则旁边另一块颜色会被撑进同一条轮廓。
+    # 严格颜色按配置里的 HSV 走，不再按整幅亮度把饱和度和明度放宽。
+    # 曝光用 --light 锁定，红蓝应落在这组阈值里。放宽只比严格低一档，用来补接缝。
     hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
-    dim = _scale_for_dim_light(hsv)
     strict = np.zeros(color_bgr.shape[:2], dtype=np.uint8)
     loose = np.zeros(color_bgr.shape[:2], dtype=np.uint8)
     front = np.zeros(color_bgr.shape[:2], dtype=np.uint8)
     speck = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_scaled_odd(3, pixel_scale),) * 2)
     for spec in colors:
-        low = np.array(spec["hsv_low"], dtype=float)
-        low[1] = np.clip(low[1] * dim, 30, 255)
-        low[2] = np.clip(low[2] * dim, 20, 255)
-        low = low.astype(np.uint8)
+        low = np.array(spec["hsv_low"], dtype=np.uint8)
         high = np.array(spec["hsv_high"], dtype=np.uint8)
         part = cv2.inRange(hsv, low, high)
         part = cv2.morphologyEx(part, cv2.MORPH_OPEN, speck)
         strict = cv2.bitwise_or(strict, part)
-        loose = cv2.bitwise_or(loose, _hue_range(hsv, spec, 25, 25))
+        loose_s = max(50, int(low[1]) - 40)
+        loose_v = 25
+        loose = cv2.bitwise_or(loose, _hue_range(hsv, spec, loose_s, loose_v))
         if spec.get("front"):
             front = cv2.bitwise_or(front, part)
     loose = cv2.bitwise_or(loose, strict)
@@ -119,64 +107,21 @@ def _cube_silhouette(
     pixel_scale: float = 1.0,
     seam_full_px: int = 11,
 ) -> np.ndarray | None:
-    # 绿线沿严格红蓝走。种子先要成片，再比地面长边谁更接近边长。
-    # 长边超过 2.5 倍边长的块丢掉之后，稀疏的线材补不上这个门槛，不能接替方块。
+    # 绿线沿严格红蓝走。长边和高度只做门限，通过的里面取像素最多的一块。
+    # 远处深度把长边晃离 0.2 m 时，杂物不会因为碰巧更接近边长而盖过方块。
     # 放宽颜色只填红蓝接缝那大约 10 px。再往外一个边长是上限，木板和机器人进不来。
-    valid = _valid_depth(depth, zmin, zmax)
-    ys, xs = np.nonzero(strict)
-    if len(xs) < 3:
+    packed = _elevated_maps(strict, depth, intr, plane, cube_size, zmin, zmax)
+    if packed is None:
         return None
-    z = depth[ys, xs]
-    good = valid[ys, xs]
-    if int(good.sum()) < 3:
-        return None
-    points = deproject_pixels(np.column_stack([xs[good], ys[good]]), z[good], intr)
-    height = plane.signed_distance(points)
-    elevated = (height > GROUND_CLEARANCE_M) & (height < cube_size + 0.08)
-    if int(elevated.sum()) < 3:
-        return None
-    elev = np.zeros(strict.shape, dtype=np.uint8)
-    elev[ys[good][elevated], xs[good][elevated]] = 255
-    height_img = np.full(strict.shape, np.nan, dtype=float)
-    height_img[ys[good], xs[good]] = height
+    elev, height_img = packed
     # 定位用大约 11 px 把红蓝接上。全分辨率重描时用 3 px，避免把棱向外胀开。
     seam_px = _scaled_odd(seam_full_px, pixel_scale)
     seam_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seam_px, seam_px))
     blob = cv2.dilate(elev, seam_kernel)
-    count, labels = cv2.connectedComponents(blob, connectivity=8)
-    best_rank: tuple[float, float, float] | None = None
-    best_seed: np.ndarray | None = None
-    for lab in range(1, count):
-        seed = (labels == lab) & (elev > 0)
-        n_seed = int(seed.sum())
-        if n_seed < 3:
-            continue
-        z_med = float(np.median(depth[seed]))
-        if not np.isfinite(z_med) or z_med <= 1e-3:
-            continue
-        edge_px = cube_size * float(intr.fx) / z_med
-        # 门槛按这一距离上一个面的 2% 走。远处半分辨率只剩三十来个像素时，不再用近处的 8%。
-        min_solid = max(12, int(0.02 * edge_px * edge_px))
-        if n_seed < min_solid:
-            continue
-        sy, sx = np.nonzero(seed)
-        box = (int(sx.max()) - int(sx.min()) + 1) * (int(sy.max()) - int(sy.min()) + 1)
-        # 线材铺开时长边也能接近边长，像素占不满外接框，先丢掉。
-        if n_seed < 0.12 * box:
-            continue
-        long_side = _span_long_side(seed.astype(np.uint8) * 255, depth, intr, plane)
-        if long_side is not None and long_side > cube_size * 2.5:
-            continue
-        # 量不出长边的成片块排在后面。远处深度稀时仍能留下，不让它盖过已经量准的方块。
-        if long_side is None:
-            rank = (1.0, 0.0, -float(n_seed))
-        else:
-            rank = (0.0, abs(long_side - cube_size), -float(n_seed))
-        if best_rank is None or rank < best_rank:
-            best_rank = rank
-            best_seed = seed
-    if best_seed is None:
+    seeds = _top_seeds(blob, elev, depth, height_img, intr, plane, cube_size, limit=1)
+    if not seeds:
         return None
+    best_seed = seeds[0]
     z_med = float(np.median(depth[best_seed]))
     if not np.isfinite(z_med) or z_med <= 1e-3:
         return None
@@ -200,6 +145,7 @@ def _cube_silhouette(
         & window
     )
     seam_band = cv2.dilate(best_seed.astype(np.uint8) * 255, seam_kernel)
+    valid = _valid_depth(depth, zmin, zmax)
     bridge_px = (loose > 0) & (seam_band > 0) & window & valid & ~best_seed
     bridge = np.zeros(strict.shape, dtype=bool)
     by, bx = np.nonzero(bridge_px)
@@ -222,6 +168,75 @@ def _cube_silhouette(
         cv2.fillConvexPoly(filled, hull, 255)
         mask = filled
     return mask
+
+
+def _elevated_maps(strict, depth, intr, plane, cube_size, zmin, zmax):
+    # 离地 3.5 cm 到边长加 8 cm 的严格颜色。地面和太高的杂物不进种子。
+    valid = _valid_depth(depth, zmin, zmax)
+    ys, xs = np.nonzero(strict)
+    if len(xs) < 3:
+        return None
+    z = depth[ys, xs]
+    good = valid[ys, xs]
+    if int(good.sum()) < 3:
+        return None
+    points = deproject_pixels(np.column_stack([xs[good], ys[good]]), z[good], intr)
+    height = plane.signed_distance(points)
+    elevated = (height > GROUND_CLEARANCE_M) & (height < cube_size + 0.08)
+    if int(elevated.sum()) < 3:
+        return None
+    elev = np.zeros(strict.shape, dtype=np.uint8)
+    elev[ys[good][elevated], xs[good][elevated]] = 255
+    height_img = np.full(strict.shape, np.nan, dtype=float)
+    height_img[ys[good], xs[good]] = height
+    return elev, height_img
+
+
+def _top_seeds(
+    blob: np.ndarray,
+    elev: np.ndarray,
+    depth: np.ndarray,
+    height_img: np.ndarray,
+    intr,
+    plane: Plane,
+    cube_size: float,
+    limit: int = 3,
+) -> list[np.ndarray]:
+    # 长边可以短到半个边长，偏长不超过 max(4 cm, 0.02z)。高度 90 分位仍要接近边长。
+    count, labels = cv2.connectedComponents(blob, connectivity=8)
+    passed: list[tuple[int, np.ndarray]] = []
+    for lab in range(1, count):
+        seed = (labels == lab) & (elev > 0)
+        n_seed = int(seed.sum())
+        if n_seed < 3:
+            continue
+        z_med = float(np.median(depth[seed]))
+        if not np.isfinite(z_med) or z_med <= 1e-3:
+            continue
+        edge_px = cube_size * float(intr.fx) / z_med
+        min_solid = max(12, int(0.02 * edge_px * edge_px))
+        if n_seed < min_solid:
+            continue
+        sy, sx = np.nonzero(seed)
+        box = (int(sx.max()) - int(sx.min()) + 1) * (int(sy.max()) - int(sy.min()) + 1)
+        if n_seed < 0.12 * box:
+            continue
+        long_side = _span_long_side(seed.astype(np.uint8) * 255, depth, intr, plane)
+        if long_side is None or long_side > cube_size * 2.5:
+            continue
+        # 红顶缺深度时跨度会偏短，仍留下。偏长的是红地面或木台并进来，丢掉。
+        if long_side < 0.5 * cube_size or long_side > cube_size + max(0.04, 0.02 * z_med):
+            continue
+        heights = height_img[seed]
+        heights = heights[np.isfinite(heights)]
+        if len(heights) < 3:
+            continue
+        peak = float(np.percentile(heights, 90))
+        if peak < 0.5 * cube_size or peak > cube_size + 0.08:
+            continue
+        passed.append((n_seed, seed))
+    passed.sort(key=lambda item: item[0], reverse=True)
+    return [seed for _n, seed in passed[:limit]]
 
 
 def _span_long_side(component: np.ndarray, depth: np.ndarray, intr, plane: Plane) -> float | None:
@@ -377,20 +392,6 @@ def _half_view(color_bgr: np.ndarray, depth: np.ndarray, intr):
     return color, small_depth, small_intr, sx
 
 
-def _expand_roi(mask: np.ndarray, pad: int) -> np.ndarray | None:
-    # 半分辨率只给出方块大概在哪。外接框向外留一圈，全分辨率重描时棱不会被裁掉。
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        return None
-    y0 = max(int(ys.min()) - pad, 0)
-    y1 = min(int(ys.max()) + pad + 1, mask.shape[0])
-    x0 = max(int(xs.min()) - pad, 0)
-    x1 = min(int(xs.max()) + pad + 1, mask.shape[1])
-    roi = np.zeros(mask.shape, dtype=np.uint8)
-    roi[y0:y1, x0:x1] = 255
-    return roi
-
-
 def _crop_view(color_bgr: np.ndarray, depth: np.ndarray, intr, roi: np.ndarray):
     # 只把方块附近裁出来做全分辨率。主点跟着裁切原点移，焦距不变。
     ys, xs = np.nonzero(roi)
@@ -466,6 +467,83 @@ def _mask_from_plane(
     return mask, front
 
 
+def _locate_rois(
+    color_bgr: np.ndarray,
+    depth: np.ndarray,
+    colors: list[dict],
+    plane: Plane,
+    intr,
+    cube_size: float,
+    zmin: float,
+    zmax: float,
+    pad: int = 24,
+    limit: int = 3,
+) -> list[tuple[np.ndarray, int]]:
+    # 半分辨率列出最多三块候选，外接框映回全图再外扩。全分辨率对每一块重描。
+    color, depth_s, intr_s, scale = _half_view(color_bgr, depth, intr)
+    strict, _loose, _front = _color_layers(color, colors, pixel_scale=scale)
+    packed = _elevated_maps(strict, depth_s, intr_s, plane, cube_size, zmin, zmax)
+    if packed is None:
+        return []
+    elev, height_img = packed
+    seam_px = _scaled_odd(11, scale)
+    blob = cv2.dilate(elev, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seam_px, seam_px)))
+    seeds = _top_seeds(blob, elev, depth_s, height_img, intr_s, plane, cube_size, limit=limit)
+    height, width = color_bgr.shape[:2]
+    rois: list[tuple[np.ndarray, int]] = []
+    for seed in seeds:
+        ys, xs = np.nonzero(seed)
+        if len(xs) == 0:
+            continue
+        x0 = max(int(np.floor(float(xs.min()) / scale)) - pad, 0)
+        x1 = min(int(np.ceil(float(xs.max() + 1) / scale)) + pad, width)
+        y0 = max(int(np.floor(float(ys.min()) / scale)) - pad, 0)
+        y1 = min(int(np.ceil(float(ys.max() + 1) / scale)) + pad, height)
+        roi = np.zeros((height, width), dtype=np.uint8)
+        roi[y0:y1, x0:x1] = 255
+        expected = int(round(float(seed.sum()) / (scale * scale)))
+        rois.append((roi, expected))
+    return rois
+
+
+def _refine_roi(
+    color_bgr,
+    depth,
+    colors,
+    plane,
+    intr,
+    cube_size,
+    zmin,
+    zmax,
+    roi,
+    expected_n: int = 0,
+):
+    # 先用 3 px 接缝。掩膜不到定位像素的一半时，红蓝没接上，再用 11 px。
+    refined = _mask_from_plane(
+        color_bgr, depth, colors, plane, intr, cube_size, zmin, zmax, pixel_scale=1.0, seam_full_px=3, roi=roi
+    )
+    small = refined is None or (
+        expected_n > 0 and int(np.count_nonzero(refined[0])) * 2 < expected_n
+    )
+    if small:
+        wider = _mask_from_plane(
+            color_bgr,
+            depth,
+            colors,
+            plane,
+            intr,
+            cube_size,
+            zmin,
+            zmax,
+            pixel_scale=1.0,
+            seam_full_px=11,
+            roi=roi,
+        )
+        if wider is not None:
+            refined = wider
+    return refined
+
+
 def prepare_mask(
     color_bgr: np.ndarray,
     depth: np.ndarray,
@@ -476,56 +554,29 @@ def prepare_mask(
     intr=None,
     cube_size: float = 0.2,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    # 有地面时，半分辨率只找方块在哪。找到后在全分辨率上用 3 px 接缝重描，足迹用这一次。
-    # 半分辨率没找到时，整幅用全分辨率再找一次。重描失败才退回定位掩膜。
+    # 有地面时，半分辨率给出最多三块候选。全分辨率逐块重描，留下像素最多的一块。
+    # 一块都没定位到时，整幅用全分辨率再找一次。
     if plane is not None and intr is not None:
-        located = None
+        found: list[tuple[np.ndarray | None, int]] = []
         if min(color_bgr.shape[:2]) >= 8:
-            located = _mask_from_plane(
-                color_bgr,
-                depth,
-                colors,
-                plane,
-                intr,
-                cube_size,
-                zmin,
-                zmax,
-                pixel_scale=0.5,
-                seam_full_px=11,
+            found = _locate_rois(
+                color_bgr, depth, colors, plane, intr, cube_size, zmin, zmax
             )
-        roi = _expand_roi(located[0], 24) if located is not None else None
-        refined = _mask_from_plane(
-            color_bgr,
-            depth,
-            colors,
-            plane,
-            intr,
-            cube_size,
-            zmin,
-            zmax,
-            pixel_scale=1.0,
-            seam_full_px=3,
-            roi=roi,
-        )
-        # 3 px 接不上红蓝时，掩膜会只剩一条。同一块区域再用定位核重描，足迹才盖住顶面。
-        if located is not None and refined is not None:
-            if int(np.count_nonzero(refined[0])) * 2 < int(np.count_nonzero(located[0])):
-                refined = _mask_from_plane(
-                    color_bgr,
-                    depth,
-                    colors,
-                    plane,
-                    intr,
-                    cube_size,
-                    zmin,
-                    zmax,
-                    pixel_scale=1.0,
-                    seam_full_px=11,
-                    roi=roi,
-                )
-        if refined is not None:
-            return refined
-        return located
+        if not found:
+            found = [(None, 0)]
+        best = None
+        best_n = -1
+        for roi, expected_n in found:
+            refined = _refine_roi(
+                color_bgr, depth, colors, plane, intr, cube_size, zmin, zmax, roi, expected_n
+            )
+            if refined is None:
+                continue
+            n = int(np.count_nonzero(refined[0]))
+            if n > best_n:
+                best = refined
+                best_n = n
+        return best
     strict, _loose, front = _color_layers(color_bgr, colors)
     mask = strict
     front = cv2.bitwise_and(front, mask)
@@ -746,25 +797,41 @@ def detect_visible_cube(
     peak = float(np.percentile(height[body], 90))
     if abs(peak - cube_size) > size_tolerance + 0.05 and peak < cube_size * 0.5:
         return fail("height")
-    # 顶面往下 1 cm。正面上沿留在这层外面，投到地面时不会把框拉出绿线。
+    # 顶面往下 1 cm。这一层面积够时，正面上沿留在矩形外面。
+    # 斜视时 1 cm 只剩近处一条，面积不够就改用离地超过半个边长的点。
+    def measured(layer: np.ndarray):
+        if int(layer.sum()) < 3:
+            return None
+        pts = points[layer]
+        flags = front_flag[layer]
+        keep = _drop_near_camera(pts, plane, 0.05)
+        pts = pts[keep]
+        flags = flags[keep]
+        if len(pts) < 3:
+            return None
+        _coords, _projected, rect = _footprint(pts, plane)
+        (_center_u, _center_v), (width, height_rect), angle_deg = rect
+        long_side = max(width, height_rect)
+        short_side = min(width, height_rect)
+        fraction = float(width * height_rect) / (cube_size * cube_size)
+        return pts, flags, rect, fraction, long_side, short_side, angle_deg
+
     top = body & (height >= peak - TOP_LAYER_BELOW_PEAK_M)
-    if int(top.sum()) < 3:
+    chosen = measured(top)
+    print(
+        "DBG",
+        int(top.sum()),
+        None if chosen is None else (round(chosen[3], 3), round(chosen[4], 3), round(chosen[5], 3), len(chosen[0])),
+    )
+    if chosen is None or chosen[3] < min_footprint_fraction:
+        wider = measured(body)
+        if wider is not None:
+            chosen = wider
+    if chosen is None:
         return fail("height")
+    points_top, front_flag, rect, fraction, long_side, short_side, angle_deg = chosen
+    (center_u, center_v), _size, _angle = rect
     # 2. 足迹要接近 0.2 m × 0.2 m。太扁说明只剩一条棱，这一帧拒绝。
-    points_top = points[top]
-    front_flag = front_flag[top]
-    keep = _drop_near_camera(points_top, plane, 0.05)
-    points_top = points_top[keep]
-    front_flag = front_flag[keep]
-    if len(points_top) < 3:
-        return fail("height")
-    coords, _projected, rect = _footprint(points_top, plane)
-    (center_u, center_v), (width, height_rect), angle_deg = rect
-    long_side = max(width, height_rect)
-    short_side = min(width, height_rect)
-    area = float(width * height_rect)
-    full_area = cube_size * cube_size
-    fraction = area / full_area
     if fraction < min_footprint_fraction:
         return fail("footprint_area")
     # 近处长边仍按 24 mm。更远处按 0.02*z 放宽，2 m 约 4 cm，3 m 约 6 cm，并且不超过 size_tolerance。
