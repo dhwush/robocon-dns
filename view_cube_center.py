@@ -181,7 +181,9 @@ def main() -> None:
                         _cross(vis, body_px, (0, 255, 255), 18)
                     lines.append(f"body  x={body[0]:+.3f}  y={body[1]:+.3f}  z={body[2]:+.3f} m")
                     lines.append(f"floor x={bottom[0]:+.3f}  y={bottom[1]:+.3f}  z={bottom[2]:+.3f} m")
-                    lines.append(f"inliers={pose.inliers}  footprint={pose.footprint_fraction:.2f}")
+                    lines.append(
+                        f"inliers={pose.inliers}  footprint={pose.footprint_fraction:.2f}  {pose.source}"
+                    )
             _label(vis, lines)
             # 先缩小再并排，避免每帧拼一张 2560 宽的图再缩回去。
             half = (vis.shape[1] // 2, vis.shape[0] // 2)

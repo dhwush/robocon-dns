@@ -28,6 +28,7 @@ class CubePose:
     front_color: bool
     inliers: int = 0
     corners: np.ndarray | None = None
+    source: str = "depth"
 
 
 # --- 颜色分割 -----------------------------------------------------------------
@@ -41,6 +42,20 @@ GROUND_CLEARANCE_M = 0.035
 
 # 足迹只收实测顶面往下这一条以内的点。再宽就会带上正面上沿，矩形被拉向相机。
 TOP_LAYER_BELOW_PEAK_M = 0.010
+
+# 方块四周这一圈里，中位高度和散布都在这以内，才认为地面就是方块脚下的那一层。
+_GROUND_RING_M = 0.06
+_GROUND_BIAS_M = 0.008
+_GROUND_SPREAD_M = 0.015
+
+# 射线交点与测到的深度差过这条，像素就在侧面而不是顶面。位置仍用交点，不用测到的深度。
+_RAY_DEPTH_AGREE_M = 0.02
+# 中位深度差超过这条，才认为顶面深度确实偏了，值得改用射线。
+_RAY_BIAS_TRUST_M = 0.016
+# 顶面掩膜只剥掉最外 1 个像素，避开棱上的混合深度。再往里改在平面坐标里裁，避免斜视时把矩形裁歪。
+
+# 新旧足迹中心差过这条，就不折中，按地面是否贴脚下来取舍。
+_SCHEME_SPLIT_M = 0.02
 
 
 def _scale_for_dim_light(hsv: np.ndarray) -> float:
@@ -656,7 +671,7 @@ def _mask_points(
     pixels = np.column_stack([xs[good], ys[good]])
     points = deproject_pixels(pixels, z[good], intr)
     front_flag = front[ys[good], xs[good]] > 0
-    return points, front_flag, int(good.sum()), mask
+    return points, front_flag, int(good.sum()), mask, pixels
 
 
 # --- 地面足迹 -----------------------------------------------------------------
@@ -679,6 +694,114 @@ def _footprint(points: np.ndarray, plane: Plane) -> tuple[np.ndarray, np.ndarray
     # minAreaRect 给出中心、长宽和一条边的角度，单位与坐标相同（米、度）。
     rect = cv2.minAreaRect(coords.astype(np.float32))
     return coords, projected, rect
+
+
+def _ground_under_cube(depth: np.ndarray, mask: np.ndarray, plane: Plane, intr) -> bool:
+    # 整幅里内点够多，只说明有一块大平面，木板和地砖都会过。这里只看方块轮廓外面几厘米。
+    # 这一圈的高度中位数离开 0，或散布超过 1.5 cm，平面就不是方块脚下的那一层。
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 10:
+        return False
+    z_mask = depth[ys, xs]
+    z_mask = z_mask[np.isfinite(z_mask) & (z_mask > 0.2)]
+    if len(z_mask) < 10:
+        return False
+    radius = int(np.clip(round(_GROUND_RING_M * float(intr.fx) / float(np.median(z_mask))), 6, 48))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    ring = cv2.subtract(cv2.dilate(mask, kernel), mask)
+    ry, rx = np.nonzero(ring)
+    if len(rx) < 30:
+        return False
+    step = max(len(rx) // 800, 1)
+    rx = rx[::step]
+    ry = ry[::step]
+    rz = depth[ry, rx]
+    good = np.isfinite(rz) & (rz > 0.2)
+    if int(good.sum()) < 25:
+        return False
+    points = deproject_pixels(np.column_stack([rx[good], ry[good]]), rz[good], intr)
+    dist = plane.signed_distance(points)
+    band = np.abs(dist) < 0.05
+    if int(band.sum()) < 25 or int(band.sum()) < 0.45 * len(dist):
+        return False
+    sample = dist[band]
+    if abs(float(np.median(sample))) > _GROUND_BIAS_M:
+        return False
+    return float(np.percentile(np.abs(sample), 75)) <= _GROUND_SPREAD_M
+
+
+def _intersect_lifted_plane(pixels: np.ndarray, plane: Plane, intr, lift: float) -> np.ndarray:
+    # 像素只定射线。交点落在与地面平行、抬高 lift 的平面上，不乘测到的深度。
+    dirs = deproject_pixels(pixels, np.ones(len(pixels)), intr)
+    denom = dirs @ np.asarray(plane.normal, dtype=float)
+    level = float(plane.offset) + float(lift)
+    t = np.full(len(dirs), np.nan)
+    ok = np.abs(denom) > 1e-6
+    t[ok] = level / denom[ok]
+    t[~(t > 0.0)] = np.nan
+    return t[:, None] * dirs
+
+
+def _ray_top_points(
+    pixels: np.ndarray,
+    measured: np.ndarray,
+    front: np.ndarray,
+    depth_shape: tuple[int, int],
+    plane: Plane,
+    intr,
+    cube_size: float,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    # 顶面外圈两三像素是棱，深度常混进正面。先剥掉，点不够再退回没剥的那一版。
+    # 测到的深度只用来丢掉侧面：侧面的射线要走得更远才碰到抬高的平面。
+    if len(pixels) < 3:
+        return None
+    sel = np.zeros(depth_shape, dtype=np.uint8)
+    sel[pixels[:, 1].astype(int), pixels[:, 0].astype(int)] = 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    eroded = cv2.erode(sel, kernel)
+    keep = eroded[pixels[:, 1].astype(int), pixels[:, 0].astype(int)] > 0
+    if int(keep.sum()) < 20:
+        keep = np.ones(len(pixels), dtype=bool)
+    hits = _intersect_lifted_plane(pixels[keep], plane, intr, cube_size)
+    z_hit = hits[:, 2]
+    agree = np.isfinite(z_hit) & (np.abs(z_hit - measured[keep]) < _RAY_DEPTH_AGREE_M)
+    if int(agree.sum()) < 3:
+        return None
+    median_dz = float(np.median(np.abs(z_hit[agree] - measured[keep][agree])))
+    return hits[agree], front[keep][agree], median_dz
+
+
+def _rectangle_on_plane(
+    points: np.ndarray,
+    plane: Plane,
+    cube_size: float,
+    min_footprint_fraction: float,
+    size_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None:
+    # 投影后做最小外接矩形。长边、短边或面积不合格就不用这套点。
+    if len(points) < 3:
+        return None
+    coords, _projected, rect = _footprint(points, plane)
+    (center_u, center_v), (width, height_rect), angle_deg = rect
+    long_side = max(width, height_rect)
+    short_side = min(width, height_rect)
+    fraction = float(width * height_rect) / (cube_size * cube_size)
+    if fraction < min_footprint_fraction:
+        return None
+    z_ref = float(np.median(points[:, 2]))
+    if not np.isfinite(z_ref) or z_ref <= 0.0:
+        z_ref = 1.0
+    side_limit = min(float(size_tolerance), max(0.12 * cube_size, 0.02 * z_ref))
+    if abs(long_side - cube_size) > side_limit or short_side < cube_size * 0.45:
+        return None
+    axis_x, axis_y = plane.basis()
+    origin = plane.origin()
+    bottom = origin + center_u * axis_x + center_v * axis_y
+    box = cv2.boxPoints(rect)
+    corners = origin + box[:, 0:1] * axis_x + box[:, 1:2] * axis_y
+    angle = np.deg2rad(angle_deg)
+    edge_2d = np.array([np.cos(angle), np.sin(angle)])
+    return bottom, corners, coords, edge_2d, fraction
 
 
 def _drop_near_camera(points: np.ndarray, plane: Plane, fraction: float = 0.05) -> np.ndarray:
@@ -728,7 +851,7 @@ def detect_visible_cube(
     )
     if packed is None:
         return fail("mask")
-    points, front_flag, count, _mask = packed
+    points, front_flag, count, mask, pixels = packed
     if count < min_pixels:
         return fail("inliers")
     height = plane.signed_distance(points)
@@ -738,6 +861,7 @@ def detect_visible_cube(
         return fail("inliers")
     points = points[on_cube]
     front_flag = front_flag[on_cube]
+    pixels = pixels[on_cube]
     # 落地边和凸包里贴近地面的点不参与 90 分位。峰值只在离地超过半个边长的点上取。
     height = plane.signed_distance(points)
     body = height > max(GROUND_CLEARANCE_M, 0.5 * cube_size)
@@ -750,44 +874,59 @@ def detect_visible_cube(
     top = body & (height >= peak - TOP_LAYER_BELOW_PEAK_M)
     if int(top.sum()) < 3:
         return fail("height")
-    # 2. 足迹要接近 0.2 m × 0.2 m。太扁说明只剩一条棱，这一帧拒绝。
+    # 2. 两套足迹。旧的把测到的顶面点压到地面。新的用射线和抬高一个边长的平面求交。
+    # 中心差过 2 cm 时不取平均：方块脚下贴着平面就用新的，贴不上就用旧的。
+    # 中心还接近时留旧的，避免几毫米的平面误差被射线放大。
     points_top = points[top]
-    front_flag = front_flag[top]
+    front_top = front_flag[top]
+    pixels_top = pixels[top]
     keep = _drop_near_camera(points_top, plane, 0.05)
-    points_top = points_top[keep]
-    front_flag = front_flag[keep]
-    if len(points_top) < 3:
-        return fail("height")
-    coords, _projected, rect = _footprint(points_top, plane)
-    (center_u, center_v), (width, height_rect), angle_deg = rect
-    long_side = max(width, height_rect)
-    short_side = min(width, height_rect)
-    area = float(width * height_rect)
-    full_area = cube_size * cube_size
-    fraction = area / full_area
-    if fraction < min_footprint_fraction:
-        return fail("footprint_area")
-    # 近处长边仍按 24 mm。更远处按 0.02*z 放宽，2 m 约 4 cm，3 m 约 6 cm，并且不超过 size_tolerance。
-    z_ref = float(np.median(points_top[:, 2]))
-    if not np.isfinite(z_ref) or z_ref <= 0.0:
-        z_ref = 1.0
-    side_limit = min(float(size_tolerance), max(0.12 * cube_size, 0.02 * z_ref))
-    if abs(long_side - cube_size) > side_limit:
+    old = _rectangle_on_plane(
+        points_top[keep],
+        plane,
+        cube_size,
+        min_footprint_fraction,
+        size_tolerance,
+    )
+    ray = _ray_top_points(
+        pixels_top,
+        points_top[:, 2],
+        front_top,
+        depth.shape[:2],
+        plane,
+        intr,
+        cube_size,
+    )
+    new = None if ray is None else _rectangle_on_plane(
+        ray[0],
+        plane,
+        cube_size,
+        min_footprint_fraction,
+        size_tolerance,
+    )
+    ray_front = None if ray is None or new is None else ray[1]
+    # 测到的深度和射线交点差不多时，位置差来自棱上的点，不是顶面深度偏了。这种差不改用射线。
+    ground_ok = _ground_under_cube(depth, mask, plane, intr)
+    # 中心差过 2 cm 才算两套足迹真正不一致。这时不取中点：脚下贴着平面、并且深度确实偏了，才信射线。
+    # 中心还接近，或深度并没有偏，留深度投影。射线会把平面上几毫米的高度误差放大到足迹上。
+    center_gap = 0.0 if old is None or new is None else float(np.linalg.norm(old[0] - new[0]))
+    center_split = old is not None and new is not None and center_gap > _SCHEME_SPLIT_M
+    depth_biased = ray is not None and ray[2] > _RAY_BIAS_TRUST_M
+    trust_ray = new is not None and ground_ok and depth_biased and (old is None or center_split)
+    if trust_ray:
+        bottom, corners, coords, edge_2d, fraction = new
+        front_flag = ray_front
+        source = "ray"
+    elif old is not None:
+        bottom, corners, coords, edge_2d, fraction = old
+        front_flag = front_top[keep]
+        source = "depth"
+    else:
         return fail("footprint_long")
-    # 短边太窄说明只剩一条棱，这一帧丢掉。
-    if short_side < cube_size * 0.45:
-        return fail("footprint_short")
     # 3. 底面中心给位置。能分出正面颜色时，用颜色重心相对足迹中心的方向当 yaw；
     #    否则用矩形棱的方向，并折进 90° 周期。
     axis_x, axis_y = plane.basis()
-    origin = plane.origin()
-    # 矩形中心已经在平面坐标里，抬回三维就是底面中心，不是点云重心。
-    bottom = origin + center_u * axis_x + center_v * axis_y
-    box = cv2.boxPoints(rect)
-    corners = origin + box[:, 0:1] * axis_x + box[:, 1:2] * axis_y
-    angle = np.deg2rad(angle_deg)
-    edge_2d = np.array([np.cos(angle), np.sin(angle)])
-    front_ratio = float(front_flag.mean())
+    front_ratio = float(front_flag.mean()) if len(front_flag) else 0.0
     # 正面像素太少或几乎占满（整块都是同一颜色）时，分不出哪条棱朝前。
     front_seen = 0.08 < front_ratio < 0.85
     if front_seen:
@@ -814,4 +953,5 @@ def detect_visible_cube(
         front_color=front_seen,
         inliers=count,
         corners=corners,
+        source=source,
     )

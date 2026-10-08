@@ -273,6 +273,64 @@ def test_mask_stays_on_cube_when_background_is_raised():
     assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.04
 
 
+def test_ray_when_ground_holds_depth_when_plane_is_high():
+    """俯视、顶面深度只偏 1 cm 多时，足迹中心移动不到 2 cm，仍用深度投影。
+    平面整体抬高之后脚下对不上，也退回深度投影，不能用这张平面做射线。"""
+    from geom.transform import deproject_pixels
+
+    intr = intrinsics_for(320, 240)
+    center = np.array([0.08, 0.06, 0.7])
+    cfg = load_config("config/default.yaml")
+    color, depth = render_cube(
+        intr,
+        center,
+        0.35,
+        size=float(cfg["cube_size"]),
+        ground_z=float(center[2]),
+        noise_m=0.0,
+        top_bgr=(40, 40, 220),
+    )
+    depth_f = filter_depth(depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
+    from ground.plane import sample_points
+
+    plane = fit_ground(sample_points(depth_f, intr, stride=3), np.array([0.0, 0.0, 1.0]))
+    assert plane is not None
+    biased = depth_f.copy()
+    ys, xs = np.nonzero(np.isfinite(biased))
+    pts = deproject_pixels(np.column_stack([xs, ys]), biased[ys, xs], intr)
+    height = plane.signed_distance(pts)
+    top = height > 0.12
+    biased[ys[top], xs[top]] -= 0.018
+    pose = detect_visible_cube(
+        color,
+        biased,
+        intr,
+        plane,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        min_pixels=200,
+        min_footprint_fraction=0.35,
+        size_tolerance=float(cfg["size_tolerance"]),
+    )
+    assert pose is not None
+    assert pose.source == "depth"
+    assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.03
+    raised = Plane(normal=plane.normal.copy(), offset=float(plane.offset) + 0.02)
+    pose_depth = detect_visible_cube(
+        color,
+        depth_f,
+        intr,
+        raised,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        min_pixels=200,
+        min_footprint_fraction=0.35,
+        size_tolerance=float(cfg["size_tolerance"]),
+    )
+    assert pose_depth is not None
+    assert pose_depth.source == "depth"
+
+
 def test_field_corner_recovers_extrinsic(tmp_path):
     """已知外参下，原点出发的长边 2 m 和短边 1.2 m 应解回同一组 R、t。
     写入 yaml 再读回，数值不变。"""
