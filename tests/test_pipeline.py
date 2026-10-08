@@ -3,7 +3,7 @@
 import numpy as np
 
 from camera.source import color_lock_from_config, filter_depth, remove_flying_pixels
-from cube.detect import detect_visible_cube, prepare_mask
+from cube.detect import color_mask, detect_visible_cube, prepare_mask, standard_color_chips, render_color_standard
 from cube.face_fallback import fit_when_face_missing
 from field.extrinsic import Segment, estimate_from_lines, save_extrinsic, load_extrinsic
 from fuse.median import angle_delta, average_scores, band_score, fuse_poses, score_trial
@@ -34,6 +34,29 @@ def test_light_levels_change_exposure_gain_and_brightness():
     except SystemExit:
         return
     raise AssertionError("unknown light level should be rejected")
+
+
+def test_standard_red_and_blue_sit_inside_the_gates():
+    """标准红、蓝是满饱和原色，并且落在配置的 HSV 门槛里。低于门槛的色块进不了掩膜。"""
+    cfg = load_config("config/default.yaml")
+    chips = {chip["name"]: chip for chip in standard_color_chips(cfg["colors"])}
+    assert chips["red"]["hsv"] == (0, 255, 255)
+    assert chips["red"]["bgr"] == (0, 0, 255)
+    assert chips["blue"]["hsv"] == (120, 255, 255)
+    assert chips["blue"]["bgr"] == (255, 0, 0)
+    canvas = np.zeros((40, 80, 3), dtype=np.uint8)
+    canvas[:, :40] = chips["red"]["bgr"]
+    canvas[:, 40:] = chips["blue"]["bgr"]
+    mask, _front = color_mask(canvas, cfg["colors"])
+    assert int(mask[:, :40].min()) == 255
+    assert int(mask[:, 40:].min()) == 255
+    dark = np.full((80, 80, 3), 128, dtype=np.uint8)
+    dark[20:60, 20:60] = (0, 0, 30)
+    dark_mask, _front = color_mask(dark, cfg["colors"])
+    assert int(dark_mask[20:60, 20:60].max()) == 0
+    chart = render_color_standard(cfg["colors"], "daylight", cfg["light_levels"])
+    assert chart.shape == (300, 880, 3)
+    assert int(chart[80, 40, 2]) > 200
 
 
 def test_flying_pixels_removed():

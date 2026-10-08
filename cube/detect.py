@@ -117,6 +117,148 @@ def color_mask(color_bgr: np.ndarray, colors: list[dict]) -> tuple[np.ndarray, n
     return strict, cv2.bitwise_and(front, strict)
 
 
+def _spec_is_red(spec: dict) -> bool:
+    # 红在色相环两端。蓝落在 100–130。名字优先，没有名字时用色相段判断。
+    name = str(spec.get("name", ""))
+    if name.startswith("red"):
+        return True
+    if name.startswith("blue"):
+        return False
+    low = int(spec["hsv_low"][0])
+    high = int(spec["hsv_high"][0])
+    return low <= 15 or high >= 165
+
+
+def _hsv_to_bgr(hue: int, sat: int, val: int) -> tuple[int, int, int]:
+    patch = np.array([[[hue, sat, val]]], dtype=np.uint8)
+    bgr = cv2.cvtColor(patch, cv2.COLOR_HSV2BGR)[0, 0]
+    return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+
+def standard_color_chips(colors: list[dict]) -> list[dict]:
+    # 图像识别里的标准红、标准蓝是满饱和、满明度的原色。
+    # 色相取配置门槛里包住的那一个：红是 0，蓝是 120。门槛里没有时用该段中点。
+    grouped: dict[str, list[dict]] = {"red": [], "blue": []}
+    for spec in colors:
+        grouped["red" if _spec_is_red(spec) else "blue"].append(spec)
+    chips = []
+    for name, preferred in (("red", 0), ("blue", 120)):
+        specs = grouped[name]
+        if not specs:
+            continue
+        covered = any(int(spec["hsv_low"][0]) <= preferred <= int(spec["hsv_high"][0]) for spec in specs)
+        if covered:
+            hue = preferred
+        else:
+            spec = specs[0]
+            hue = int(round(0.5 * (int(spec["hsv_low"][0]) + int(spec["hsv_high"][0]))))
+        sat_low = min(int(spec["hsv_low"][1]) for spec in specs)
+        val_low = min(int(spec["hsv_low"][2]) for spec in specs)
+        chips.append(
+            {
+                "name": name,
+                "hsv": (hue, 255, 255),
+                "bgr": _hsv_to_bgr(hue, 255, 255),
+                "gate_bgr": _hsv_to_bgr(hue, sat_low, val_low),
+                "sat_low": sat_low,
+                "val_low": val_low,
+                "ranges": [(int(spec["hsv_low"][0]), int(spec["hsv_high"][0])) for spec in specs],
+            }
+        )
+    return chips
+
+
+def measure_scene_hsv(color_bgr: np.ndarray, colors: list[dict]) -> dict[str, tuple[int, int, int] | None]:
+    # 只按色相圈出红和蓝，饱和度和明度留着跟门槛比。进不了严格掩膜时仍能看出偏暗还是发白。
+    hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    found: dict[str, tuple[int, int, int] | None] = {}
+    for chip in standard_color_chips(colors):
+        band = np.zeros(hue.shape, dtype=bool)
+        for low, high in chip["ranges"]:
+            if low <= high:
+                band |= (hue >= low) & (hue <= high)
+            else:
+                band |= (hue >= low) | (hue <= high)
+        count = int(band.sum())
+        if count < 30:
+            found[chip["name"]] = None
+            continue
+        pix = hsv[band]
+        values = pix[:, 0].astype(np.int16)
+        if chip["name"] == "red":
+            values = np.where(values > 90, values - 180, values)
+        median_h = int(np.median(values)) % 180
+        found[chip["name"]] = (median_h, int(np.median(pix[:, 1])), int(np.median(pix[:, 2])))
+    return found
+
+
+def _light_step(light_name: str, levels: dict | None, measured: tuple[int, int, int] | None, chip: dict) -> str:
+    # 曝光从 bright 到 dark 递增。发白就往曝光更低的一档走，偏暗就往更高的一档走。
+    names = list(levels) if levels else []
+    index = names.index(light_name) if light_name in names else -1
+    if measured is None:
+        return "no pixels"
+    _hue, sat, val = measured
+    if val < chip["val_low"]:
+        if 0 <= index < len(names) - 1:
+            return f"too dark -> --light {names[index + 1]}"
+        return "too dark"
+    if sat < chip["sat_low"]:
+        if index > 0:
+            return f"washed out -> --light {names[index - 1]}"
+        return "washed out"
+    return "in range"
+
+
+def render_color_standard(
+    colors: list[dict],
+    light_name: str = "daylight",
+    light_levels: dict | None = None,
+    measured: dict | None = None,
+) -> np.ndarray:
+    # 左块是标准色，右块是当前画面里同色相的中值。底下一条是还能进掩膜的最暗颜色。
+    chips = standard_color_chips(colors)
+    width, height = 880, 300
+    image = np.full((height, width, 3), 32, dtype=np.uint8)
+    if not chips:
+        return image
+    slot = width // len(chips)
+
+    def _text(origin: tuple[int, int], line: str) -> None:
+        cv2.putText(image, line, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, line, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+    for index, chip in enumerate(chips):
+        x0 = index * slot + 24
+        hue, sat, val = chip["hsv"]
+        cv2.rectangle(image, (x0, 48), (x0 + 150, 148), chip["bgr"], -1)
+        cv2.rectangle(image, (x0, 156), (x0 + 150, 184), chip["gate_bgr"], -1)
+        _text((x0, 32), f"{chip['name']}  H{hue} S{sat} V{val}")
+        _text((x0, 206), f"gate S>={chip['sat_low']} V>={chip['val_low']}")
+        scene = None if measured is None else measured.get(chip["name"])
+        if scene is None:
+            _text((x0, 240), "scene: none")
+        else:
+            swatch = _hsv_to_bgr(*scene)
+            cv2.rectangle(image, (x0 + 168, 48), (x0 + 250, 148), swatch, -1)
+            _text((x0, 240), f"scene H{scene[0]} S{scene[1]} V{scene[2]}")
+        _text((x0, 272), _light_step(light_name, light_levels, scene, chip))
+    return image
+
+
+def show_color_standard(image: np.ndarray, pump: bool = True) -> bool:
+    # 没有显示器时不打断取流。调用方继续跑，只是看不到这块色板。
+    # pump 为假时不取键盘，留给已经在等按键的那个窗口。
+    try:
+        cv2.imshow("color standard", image)
+        if pump:
+            cv2.waitKey(1)
+    except cv2.error:
+        return False
+    return True
+
+
 def _valid_depth(depth: np.ndarray, zmin: float, zmax: float) -> np.ndarray:
     # 工作距离内的有限深度才参与选块。NaN 和超距点不能拿来判断这块是不是方块。
     return np.isfinite(depth) & (depth >= zmin) & (depth <= zmax)

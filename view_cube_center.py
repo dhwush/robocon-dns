@@ -15,7 +15,13 @@ import cv2
 import numpy as np
 
 from camera.source import RealSenseSource, color_lock_from_config, filter_depth
-from cube.detect import detect_visible_cube, prepare_mask
+from cube.detect import (
+    detect_visible_cube,
+    measure_scene_hsv,
+    prepare_mask,
+    render_color_standard,
+    show_color_standard,
+)
 from geom.transform import deproject_pixels, project_points
 from ground.plane import fit_ground, plane_holds, sample_points
 from main import live_intrinsics, load_config
@@ -185,6 +191,13 @@ def main() -> None:
                         f"inliers={pose.inliers}  footprint={pose.footprint_fraction:.2f}  {pose.source}"
                     )
             _label(vis, lines)
+            chart = render_color_standard(
+                cfg["colors"],
+                lock["name"],
+                cfg.get("light_levels"),
+                measure_scene_hsv(frame.color, cfg["colors"]),
+            )
+            show_color_standard(chart, pump=False)
             # 先缩小再并排，避免每帧拼一张 2560 宽的图再缩回去。
             half = (vis.shape[1] // 2, vis.shape[0] // 2)
             preview = np.hstack(

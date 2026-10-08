@@ -20,7 +20,14 @@ import numpy as np
 import yaml
 
 from camera.source import Frame, RealSenseSource, color_lock_from_config, filter_depth, list_camera_serials
-from cube.detect import calibrate_hsv, detect_visible_cube, prepare_mask
+from cube.detect import (
+    calibrate_hsv,
+    detect_visible_cube,
+    measure_scene_hsv,
+    prepare_mask,
+    render_color_standard,
+    show_color_standard,
+)
 from field.extrinsic import (
     calibrate_from_image,
     identity_extrinsic,
@@ -463,10 +470,18 @@ def run_live(
     held_plane = None
     window = int(cfg.get("frames_to_fuse", 15))
     output_period = 1.0 / float(cfg.get("output_hz", 10))
+    light_name = str((color_lock or {}).get("name") or cfg.get("light") or "daylight")
     try:
         while True:
             frame = source.read()
             depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
+            chart = render_color_standard(
+                cfg["colors"],
+                light_name,
+                cfg.get("light_levels"),
+                measure_scene_hsv(frame.color, cfg["colors"]),
+            )
+            show_color_standard(chart)
             if calibrate_color:
                 color_frames.append((frame.color.copy(), depth))
                 if len(color_frames) < int(cfg.get("hsv_calib_frames", 30)):
