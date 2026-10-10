@@ -1,7 +1,7 @@
 """实时查看方块识别和体心。
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
-橙色线是拟合地面上最大的一块，内点放宽到 18 mm。这一路不读、不画棱方向和 yaw。按 q 或 Esc 退出。
+橙色线是拟合地面上最大的一块，内点放宽到 18 mm。画面写出地面上的前方距离、左右距离和地面 yaw。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
@@ -22,9 +22,38 @@ from cube.detect import (
     render_color_standard,
     show_color_standard,
 )
-from geom.transform import deproject_pixels, project_points
+from geom.transform import deproject_pixels, fold_yaw_quarter, project_points
 from ground.plane import fit_ground, plane_holds, sample_points
 from main import live_intrinsics, load_config
+
+
+def _on_ground(direction: np.ndarray, normal: np.ndarray) -> np.ndarray | None:
+    # 去掉沿法向的分量。相机正对地面时投影接近 0，这一帧就没有前后方向。
+    flat = np.asarray(direction, dtype=float) - float(np.dot(direction, normal)) * normal
+    norm = float(np.linalg.norm(flat))
+    if norm < 1e-6:
+        return None
+    return flat / norm
+
+
+def _ground_readout(bottom: np.ndarray, plane, edge: np.ndarray, cube_size: float):
+    # 前方、右方都在地面上，并且互相垂直。yaw 从右方量起，正方形折进 ±45°。
+    normal = plane.normal
+    forward = _on_ground(np.array([0.0, 0.0, 1.0]), normal)
+    if forward is None:
+        return None
+    right = np.cross(forward, normal)
+    right = right / np.linalg.norm(right)
+    horizontal = np.asarray(bottom, dtype=float) - plane.origin()
+    ahead = float(horizontal @ forward)
+    side = float(horizontal @ right)
+    above_top = float(plane.signed_distance(np.zeros(3))[0]) - cube_size
+    flat_edge = _on_ground(edge, normal)
+    if flat_edge is None:
+        yaw = 0.0
+    else:
+        yaw = fold_yaw_quarter(float(np.arctan2(flat_edge @ forward, flat_edge @ right)))
+    return ahead, side, above_top, yaw
 
 
 def _pixel(point: np.ndarray, intr) -> tuple[int, int] | None:
@@ -46,7 +75,6 @@ def _cross(image: np.ndarray, pixel: tuple[int, int], color: tuple[int, int, int
 def _label(image: np.ndarray, lines: list[str]) -> None:
     y = 28
     for line in lines:
-        cv2.putText(image, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(image, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
         y += 28
 
@@ -185,11 +213,14 @@ def main() -> None:
                         cv2.circle(vis, bottom_px, 5, (255, 255, 0), 1, cv2.LINE_AA)
                     if body_px is not None:
                         _cross(vis, body_px, (0, 255, 255), 18)
-                    lines.append(f"body  x={body[0]:+.3f}  y={body[1]:+.3f}  z={body[2]:+.3f} m")
-                    lines.append(f"floor x={bottom[0]:+.3f}  y={bottom[1]:+.3f}  z={bottom[2]:+.3f} m")
-                    lines.append(
-                        f"inliers={pose.inliers}  footprint={pose.footprint_fraction:.2f}  {pose.source}"
-                    )
+                    readout = _ground_readout(bottom, plane, pose.edge_direction, height)
+                    if readout is None:
+                        lines.append("camera looks straight down")
+                    else:
+                        ahead, side, above_top, yaw = readout
+                        lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
+                        lines.append(f"above top={above_top:+.3f} m")
+                        lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
             _label(vis, lines)
             chart = render_color_standard(
                 cfg["colors"],
