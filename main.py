@@ -20,14 +20,17 @@ import numpy as np
 import yaml
 
 from camera.source import Frame, RealSenseSource, color_lock_from_config, filter_depth, list_camera_serials
+from cube.aim import plan_view
 from cube.detect import (
     calibrate_hsv,
+    detect_cube_candidates,
     detect_visible_cube,
     measure_scene_hsv,
     prepare_mask,
     render_color_standard,
     show_color_standard,
 )
+from cube.rival import RivalPicker
 from field.extrinsic import (
     calibrate_from_image,
     identity_extrinsic,
@@ -36,7 +39,7 @@ from field.extrinsic import (
 from field.motion import MotionTracker
 from fuse.median import average_scores, fuse_poses, score_trial
 from geom.transform import camera_to_world, load_intrinsics, load_intrinsics_for_serial
-from ground.plane import fit_ground, plane_holds, sample_points
+from ground.plane import fit_ground, plane_holds, reuse_stable_plane, sample_points
 
 # --- 单帧估计 -----------------------------------------------------------------
 # 深度清洗 → 地面 → 可见面位姿 →（可选）看不清面时的补救 → 变到世界系。
@@ -180,6 +183,73 @@ def estimate_frame(
     # 平面上一点用于判断相机或地面是否跳了 30 mm。不写进对外的 JSON。
     world["plane_origin"] = plane.origin()
     return world
+
+
+def estimate_candidates(
+    frame: Frame,
+    intr,
+    cfg: dict,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    rejects: dict | None = None,
+    initial_up: np.ndarray | None = None,
+    plane=_UNSET,
+) -> list[dict]:
+    # 一帧最多 3 个通过足迹的物体。谁是方块由多帧的地面中心比较决定。
+    depth = frame.depth
+    if plane is _UNSET:
+        gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
+        plane = _acquire_plane(depth, intr, cfg, gravity, None)
+    if plane is None:
+        _bump(rejects, "ground")
+        return []
+    if not _ground_up_ok(plane, rotation, initial_up):
+        _bump(rejects, "world_up")
+        return []
+    poses = detect_cube_candidates(
+        frame.color,
+        depth,
+        intr,
+        plane,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        min_pixels=int(cfg["min_face_pixels"]),
+        min_footprint_fraction=float(cfg["min_footprint_fraction"]),
+        size_tolerance=float(cfg["size_tolerance"]),
+        rotation=rotation,
+        translation=translation,
+        zmin=float(cfg["depth_min"]),
+        zmax=float(cfg["depth_max"]),
+    )
+    if not poses and cfg.get("enable_face_fallback"):
+        from cube.face_fallback import fit_when_face_missing
+
+        fallback = fit_when_face_missing(
+            frame.color,
+            depth,
+            intr,
+            plane,
+            cfg["colors"],
+            cube_size=float(cfg["cube_size"]),
+            rotation=rotation,
+            translation=translation,
+        )
+        poses = [] if fallback is None else [fallback]
+    if not poses:
+        _bump(rejects, "mask")
+        return []
+    worlds = []
+    for pose in poses[:3]:
+        world = pose_to_world(pose, rotation, translation, plane, float(cfg["cube_size"]))
+        world["plane_origin"] = plane.origin()
+        world["footprint_fraction"] = float(pose.footprint_fraction)
+        world["long_side"] = float(pose.long_side)
+        world["short_side"] = float(pose.short_side)
+        world["peak"] = float(pose.peak)
+        if pose.mask is not None:
+            world["mask"] = pose.mask
+        worlds.append(world)
+    return worlds
 
 
 # --- 合成自检 -----------------------------------------------------------------
@@ -374,34 +444,166 @@ def _record(fused, samples: list[dict]) -> dict:
     }
 
 
-def _show_debug(color: np.ndarray, depth: np.ndarray, cfg: dict, record: dict, intr, corners) -> None:
-    # 调试窗口：绿色是颜色轮廓，青色是地面足迹，文字是当前世界系位姿。
+def with_view(payload: dict | None, view: dict) -> dict:
+    # 位姿记录留在融合缓冲里。俯仰和原地转角只描述这一帧该怎么转，不写进缓冲。
+    body = {} if not payload else dict(payload)
+    body["view"] = view
+    return body
+
+
+def seek_ready(miss_frames: int, ground_miss: int, need: int = 6) -> tuple[bool, bool]:
+    # 连续失败没到 need 帧时不转。地面失败也连续达到 need 时，只微调俯仰。
+    armed = int(miss_frames) >= int(need)
+    return armed, armed and int(ground_miss) >= int(need)
+
+
+def _view_for_frame(
+    color: np.ndarray,
+    depth: np.ndarray,
+    intr,
+    cfg: dict,
+    gravity: np.ndarray | None,
+    recognized: bool,
+    seek: bool,
+    ground_lost: bool = False,
+    pitch_room: float | None = None,
+    yaw_room: float | None = None,
+) -> dict:
+    # 已经识别出来时，只有被画面边切到才给 pitch、yaw。
+    # 连续几帧没有位姿之后，才用 seek_ 做每拍 2.5° 的微调。
+    return plan_view(
+        color,
+        depth,
+        intr,
+        cfg["colors"],
+        cube_size=float(cfg["cube_size"]),
+        gravity=gravity,
+        zmin=float(cfg["depth_min"]),
+        zmax=float(cfg["depth_max"]),
+        recognized=recognized,
+        seek=seek,
+        ground_lost=ground_lost,
+        pitch_room=pitch_room,
+        yaw_room=yaw_room,
+    ).as_dict()
+
+
+def _show_test_view(
+    color: np.ndarray,
+    depth: np.ndarray,
+    cfg: dict,
+    intr,
+    plane,
+    corners,
+    pose: dict | None,
+    view: dict,
+    fps: float,
+    color_lock: dict | None,
+    rival_masks: list | None = None,
+) -> bool:
+    # 和 view_cube_center 同一套画面：橙线是地面，绿线是颜色轮廓，青线是足迹，黄十字是体心。
+    # 没有显示器时不打断取流。按下 q 或 Esc 时返回真，调用方结束循环。
     import cv2
 
-    from geom.transform import project_points
+    from view_cube_center import _body_center, _cross, _draw_ground, _ground_readout, _label, _pixel
 
-    prepared = prepare_mask(color, depth, cfg["colors"], float(cfg["depth_min"]), float(cfg["depth_max"]))
     vis = color.copy()
-    if prepared is not None:
-        contours, _ = cv2.findContours(prepared[0], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    prepared = None
+    if plane is not None:
+        _draw_ground(vis, depth, intr, plane, float(cfg["ground_ransac_thresh"]))
+        prepared = prepare_mask(
+            color,
+            depth,
+            cfg["colors"],
+            float(cfg["depth_min"]),
+            float(cfg["depth_max"]),
+            plane=plane,
+            intr=intr,
+            cube_size=float(cfg["cube_size"]),
+        )
+    mask_view = np.zeros(color.shape[:2], dtype=np.uint8)
+    drawn = [mask for mask in (rival_masks or []) if mask is not None]
+    if drawn:
+        for rival in drawn:
+            contours, _ = cv2.findContours(rival, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis, contours, -1, (0, 255, 0), 2)
+        mask_view = drawn[0]
+    elif prepared is not None:
+        mask_view = prepared[0]
+        contours, _ = cv2.findContours(mask_view, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(vis, contours, -1, (0, 255, 0), 2)
-    # 绿色轮廓是颜色掩膜，青色是地面足迹。没有上表面内点，也不画标签。
-    if corners is not None:
-        pixels = np.rint(project_points(corners, intr)).astype(np.int32)
-        cv2.polylines(vis, [pixels], True, (255, 255, 0), 2, cv2.LINE_AA)
-    track = record.get("quality", {}).get("track")
-    suffix = f" [{track}]" if track else ""
-    text = f"x={record['x']:.3f} y={record['y']:.3f} yaw={record['yaw']:.3f}{suffix}"
-    cv2.putText(vis, text, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(vis, text, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.imshow("cube", vis)
-    cv2.waitKey(1)
+    lock = color_lock or {}
+    lines = [
+        f"{fps:.0f} fps  {lock.get('name', '')}  exp {float(lock.get('exposure', 0)):.0f}  gain {float(lock.get('gain', 0)):.0f}"
+    ]
+    if plane is None:
+        lines.append("no ground")
+    elif corners is None:
+        lines.append("no cube")
+    else:
+        pixels = []
+        for corner in np.asarray(corners, dtype=float):
+            pix = _pixel(corner, intr)
+            if pix is not None:
+                pixels.append(pix)
+        if len(pixels) >= 2:
+            cv2.polylines(vis, [np.array(pixels, dtype=np.int32)], True, (255, 255, 0), 2, cv2.LINE_AA)
+        bottom = np.mean(np.asarray(corners, dtype=float), axis=0)
+        body = _body_center(bottom, plane, float(cfg["cube_size"]))
+        bottom_px = _pixel(bottom, intr)
+        body_px = _pixel(body, intr)
+        if bottom_px is not None:
+            cv2.circle(vis, bottom_px, 5, (255, 255, 0), 1, cv2.LINE_AA)
+        if body_px is not None:
+            _cross(vis, body_px, (0, 255, 255), 18)
+        edge = np.asarray(corners[1], dtype=float) - np.asarray(corners[0], dtype=float)
+        readout = _ground_readout(bottom, plane, edge, float(cfg["cube_size"]))
+        if readout is None:
+            lines.append("camera looks straight down")
+        else:
+            ahead, side, above_top, yaw = readout
+            lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
+            lines.append(f"above top={above_top:+.3f} m")
+            lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
+    if pose and "x" in pose:
+        lines.append(f"world x={pose['x']:.3f}  y={pose['y']:.3f}  yaw={pose['yaw']:.3f}")
+    pitch = view.get("pitch") or {}
+    turn = view.get("yaw") or {}
+    if pitch.get("direction") not in (None, "none") or turn.get("direction") not in (None, "none"):
+        lines.append(
+            f"pitch {pitch.get('direction', 'none')} {float(pitch.get('degrees', 0)):.1f}"
+            f"  turn {turn.get('direction', 'none')} {float(turn.get('degrees', 0)):.1f}"
+        )
+    seek_pitch = view.get("seek_pitch") or {}
+    seek_turn = view.get("seek_yaw") or {}
+    if seek_pitch.get("direction") not in (None, "none") or seek_turn.get("direction") not in (None, "none"):
+        lines.append(
+            f"seek pitch {seek_pitch.get('direction', 'none')} {float(seek_pitch.get('degrees', 0)):.1f}"
+            f"  seek turn {seek_turn.get('direction', 'none')} {float(seek_turn.get('degrees', 0)):.1f}"
+        )
+    _label(vis, lines)
+    half = (vis.shape[1] // 2, vis.shape[0] // 2)
+    preview = np.hstack(
+        [
+            cv2.resize(vis, half, interpolation=cv2.INTER_AREA),
+            cv2.cvtColor(cv2.resize(mask_view, half, interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR),
+        ]
+    )
+    try:
+        cv2.imshow("cube center", preview)
+        key = cv2.waitKey(1) & 0xFF
+    except cv2.error:
+        return False
+    return key in (ord("q"), 27)
 
 
 # --- 实机循环 -----------------------------------------------------------------
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
 # field 模式从起步相机跟踪：场地边能看见就校正，看不见就用视觉，视觉也失败再靠陀螺仪，超过 track_hold_s 停止输出。
-# 合格样本满 min_samples 帧才输出 JSON。地面或外参平移跳过 30 mm 时清空缓冲。
+# 合格样本满 min_samples 帧才输出位姿。已经识别出来时，只有方块被画面边切掉才给出俯仰和原地转角。
+# 连续 seek_miss_frames 帧没有位姿，才用 seek_pitch、seek_yaw 每拍微调最多 2.5°。
+# 相机没转时，地面拟合失败或原点跳变的几帧沿用上一块合格平面。一开始俯仰或原地转就丢掉它。
+# 地面或外参平移跳过 30 mm 时清空缓冲。
 # 失败后 0.5 s 内重复上一结果，再失败则输出空对象。丢帧原因累加后写到标准错误。
 
 def _field_pose(color, intr, cfg, plane):
@@ -455,6 +657,8 @@ def run_live(
             min_points=int(cfg.get("track_min_points", 12)),
         )
     samples: list[dict] = []
+    # 绿线在最多 3 个物体之间跳时，地面中心超过 15 cm 不送进中值。
+    picker = RivalPicker(cube_size=float(cfg["cube_size"]))
     color_frames: list[tuple[np.ndarray, np.ndarray]] = []
     last_record: dict | None = None
     fail_since: float | None = None
@@ -467,10 +671,21 @@ def run_live(
     hold_s = float(cfg.get("hold_s", 0.5))
     jump_m = float(cfg.get("jump_m", 0.03))
     min_samples = int(cfg.get("min_samples", 5))
-    held_plane = None
+    stable_plane = None
+    stable_left = 0
+    turning = False
+    miss_frames = 0
+    ground_miss = 0
+    seek_pitch_sum = 0.0
+    seek_yaw_sum = 0.0
+    seek_need = int(cfg.get("seek_miss_frames", 6))
+    ground_hold_frames = int(cfg.get("ground_hold_frames", 8))
+    seek_limit = float(np.deg2rad(float(cfg.get("seek_limit_deg", 15.0))))
     window = int(cfg.get("frames_to_fuse", 15))
     output_period = 1.0 / float(cfg.get("output_hz", 10))
     light_name = str((color_lock or {}).get("name") or cfg.get("light") or "daylight")
+    vis_last = time.monotonic()
+    vis_fps = 0.0
     try:
         while True:
             frame = source.read()
@@ -481,7 +696,7 @@ def run_live(
                 cfg.get("light_levels"),
                 measure_scene_hsv(frame.color, cfg["colors"]),
             )
-            show_color_standard(chart)
+            show_color_standard(chart, pump=False)
             if calibrate_color:
                 color_frames.append((frame.color.copy(), depth))
                 if len(color_frames) < int(cfg.get("hsv_calib_frames", 30)):
@@ -522,8 +737,16 @@ def run_live(
                 gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
             else:
                 gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
-            plane = _acquire_plane(depth, intr, cfg, gravity, held_plane)
-            held_plane = plane
+            plane_fresh = _acquire_plane(depth, intr, cfg, gravity, None if turning else stable_plane)
+            plane, stable_plane, stable_left = reuse_stable_plane(
+                plane_fresh,
+                None if turning else stable_plane,
+                stable_left,
+                turning,
+                jump_m,
+                ground_hold_frames,
+            )
+            turning = False
             if tracker is not None:
                 up = None if frame.gravity is None else -frame.gravity
                 if not tracker.started:
@@ -546,19 +769,20 @@ def run_live(
                 initial_up = tracker.initial_up
                 if not tracker.reliable:
                     _bump(rejects, "track")
-                    sample = None
+                    worlds = []
                 else:
-                    sample = estimate_frame(
+                    worlds = estimate_candidates(
                         frame, intr, cfg, rotation, translation, rejects, initial_up, plane
                     )
-                    if sample is not None:
-                        sample["track"] = tracker.source
             else:
-                sample = estimate_frame(
+                worlds = estimate_candidates(
                     frame, intr, cfg, rotation, translation, rejects, initial_up, plane
                 )
-            corners = None if sample is None else sample.pop("corners_cam", None)
-            origin = None if sample is None else np.asarray(sample.pop("plane_origin"), dtype=float)
+            origin = None
+            if worlds:
+                origin = np.asarray(worlds[0].pop("plane_origin"), dtype=float)
+                for world in worlds[1:]:
+                    world.pop("plane_origin", None)
             moved = False
             if origin is not None and last_plane is not None and np.linalg.norm(origin - last_plane) > jump_m:
                 moved = True
@@ -571,18 +795,47 @@ def run_live(
             if moved:
                 samples.clear()
                 last_record = None
-                held_plane = None
+                stable_plane = None
+                stable_left = 0
+                picker.reset()
+            rival_masks = [world.pop("mask", None) for world in worlds]
+            sample = picker.choose(worlds)
+            # 绿线暂时跳到杂物上时，不把那一帧写进中值，输出仍用上一块稳定方块。
+            replay = last_record if sample is None and picker.holding and last_record is not None else None
+            if sample is not None and tracker is not None and tracker.reliable:
+                sample["track"] = tracker.source
+            chosen_mask = None
+            if sample is not None:
+                for world, mask in zip(worlds, rival_masks):
+                    if world is sample:
+                        chosen_mask = mask
+                        break
+            if chosen_mask is not None:
+                rival_masks = [chosen_mask] + [mask for mask in rival_masks if mask is not chosen_mask]
+            rival_masks = [mask for mask in rival_masks if mask is not None]
+            for world in worlds:
+                for key in ("footprint_fraction", "long_side", "short_side", "peak", "corners_cam"):
+                    if world is not sample:
+                        world.pop(key, None)
+            corners = None if sample is None else sample.pop("corners_cam", None)
+            if sample is not None:
+                for key in ("footprint_fraction", "long_side", "short_side", "peak"):
+                    sample.pop(key, None)
             if origin is not None:
                 last_plane = origin
             if translation is not None:
                 last_translation = np.asarray(translation, dtype=float).copy()
             if sample is None:
-                if fail_since is None:
-                    fail_since = now
-                if last_record is not None and now - fail_since <= hold_s:
-                    payload = last_record
+                if replay is not None:
+                    payload = replay
+                    fail_since = None
                 else:
-                    payload = {}
+                    if fail_since is None:
+                        fail_since = now
+                    if last_record is not None and now - fail_since <= hold_s:
+                        payload = last_record
+                    else:
+                        payload = {}
             else:
                 fail_since = None
                 samples.append(sample)
@@ -593,16 +846,88 @@ def run_live(
                     if fused is not None:
                         last_record = _record(fused, samples)
                         payload = last_record
-            if payload is not None and now - last_print >= output_period:
-                print(json.dumps(payload))
-                last_print = now
-                if debug and sample is not None and payload:
-                    _show_debug(frame.color, depth, cfg, payload, intr, corners)
+            aim_gravity = frame.gravity if frame.gravity is not None else gravity
+            pose_ok = sample is not None or replay is not None
+            if pose_ok:
+                miss_frames = 0
+                ground_miss = 0
+                seek_pitch_sum = 0.0
+                seek_yaw_sum = 0.0
+            else:
+                miss_frames += 1
+                if plane is None:
+                    ground_miss += 1
+                else:
+                    ground_miss = 0
+            armed, ground_lost = seek_ready(miss_frames, ground_miss, seek_need)
+            pitch_room = max(0.0, seek_limit - abs(seek_pitch_sum))
+            yaw_room = max(0.0, seek_limit - abs(seek_yaw_sum))
+            view = _view_for_frame(
+                frame.color,
+                depth,
+                intr,
+                cfg,
+                aim_gravity,
+                pose_ok,
+                armed,
+                ground_lost=ground_lost,
+                pitch_room=pitch_room,
+                yaw_room=yaw_room,
+            )
+            seek_pitch = view.get("seek_pitch") or {}
+            seek_turn = view.get("seek_yaw") or {}
+            if seek_pitch.get("direction") not in (None, "none"):
+                seek_pitch_sum += float(seek_pitch.get("signed_radians", 0.0))
+                turning = True
+            if seek_turn.get("direction") not in (None, "none"):
+                seek_yaw_sum += float(seek_turn.get("signed_radians", 0.0))
+                turning = True
+            if turning:
+                # 下一帧画面已经跟着转，不能再把点投到转之前的地面上。
+                stable_plane = None
+                stable_left = 0
+            clipped = any((view.get("clipped") or {}).values())
+            if now - last_print >= output_period:
+                # 位姿要等样本凑满。连续失败没到门限时不附 seek_。
+                # 已经识别出来时，只有被画面边切到才附上原来的 pitch、yaw。
+                has_pose = isinstance(payload, dict) and "x" in payload
+                if not pose_ok:
+                    printed = with_view(payload if has_pose else {}, view)
+                    print(json.dumps(printed))
+                    last_print = now
+                elif clipped or has_pose:
+                    printed = with_view(payload, view) if clipped else dict(payload)
+                    print(json.dumps(printed))
+                    last_print = now
+            tick = time.monotonic()
+            vis_fps = 1.0 / max(tick - vis_last, 1e-3)
+            vis_last = tick
+            pose_text = payload if isinstance(payload, dict) and "x" in payload else None
+            if _show_test_view(
+                frame.color,
+                depth,
+                cfg,
+                intr,
+                plane,
+                corners,
+                pose_text,
+                view,
+                vis_fps,
+                color_lock,
+                rival_masks,
+            ):
+                return
             if rejects != logged_rejects:
                 print(json.dumps({"reject_counts": rejects}), file=sys.stderr)
                 logged_rejects = dict(rejects)
     finally:
         source.close()
+        try:
+            import cv2
+
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
 
 
 def main() -> None:

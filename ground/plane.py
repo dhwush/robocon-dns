@@ -164,3 +164,31 @@ def sample_points(depth: np.ndarray, intr, stride: int = 8) -> np.ndarray:
         return np.zeros((0, 3))
     pixels = np.column_stack([us[good].ravel(), vs[good].ravel()])
     return deproject_pixels(pixels, z[good].ravel(), intr)
+
+
+def reuse_stable_plane(
+    fitted: Plane | None,
+    stable: Plane | None,
+    frames_left: int,
+    turning: bool,
+    jump_m: float,
+    hold_frames: int,
+) -> tuple[Plane | None, Plane | None, int]:
+    """这一帧用哪块地面，以及还能沿用几帧。
+
+    相机没有开始俯仰或原地转时，拟合失败或原点跳过 jump_m，继续用上一块合格平面。
+    一开始转，就丢掉旧平面，避免把新画面投到转之前的地面上。
+    """
+    if turning:
+        if fitted is None:
+            return None, None, 0
+        return fitted, fitted, hold_frames
+    if fitted is not None and (
+        stable is None or float(np.linalg.norm(fitted.origin() - stable.origin())) <= jump_m
+    ):
+        return fitted, fitted, hold_frames
+    if stable is not None and frames_left > 0:
+        return stable, stable, frames_left - 1
+    if fitted is not None:
+        return fitted, fitted, hold_frames
+    return None, None, 0
