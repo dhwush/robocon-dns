@@ -77,7 +77,7 @@ def test_fully_visible_off_center_needs_no_motion():
 
 
 def test_unrecognized_in_frame_uses_seek_angles():
-    """连续未识别、方块仍完整留在画面里时，seek_ 只给出 2.5° 的一步，方向朝向光轴。"""
+    """连续未识别、方块仍完整留在画面里时，转角走 2.5°，俯仰走 5°，方向朝向光轴。"""
     color, depth = _scene(40, 80, 40, 80)
     gravity = np.array([0.0, 1.0, 0.0])
     adjustment = plan_view(color, depth, _intr(), COLORS, gravity=gravity, recognized=False)
@@ -88,17 +88,18 @@ def test_unrecognized_in_frame_uses_seek_angles():
     assert not any(adjustment.clipped.values())
     assert body["pitch"]["direction"] == "none"
     assert body["yaw"]["direction"] == "none"
-    # 块在左上方。整段大约左转 18°、上仰 11°，这一拍各只走 2.5°。
+    # 块在左上方。整段大约左转 18°、上仰 11°。转角一拍 2.5°，俯仰一拍 5°。
     assert body["seek_yaw"]["direction"] == "left"
     assert body["seek_pitch"]["direction"] == "up"
     assert abs(body["seek_yaw"]["degrees"] - 2.5) < 1e-6
-    assert abs(body["seek_pitch"]["degrees"] - 2.5) < 1e-6
+    assert abs(body["seek_pitch"]["degrees"] - 5.0) < 1e-6
     assert body["seek_yaw"]["signed_radians"] < 0.0
     assert body["seek_pitch"]["signed_radians"] < 0.0
+    assert "footprint_pitch" not in body
 
 
 def test_unrecognized_on_axis_pitches_down():
-    """方块已经在光轴上但仍未识别时，下俯 2.5°，换一个能看见顶面的角度。"""
+    """方块已经在光轴上但仍未识别时，下俯 5°，换一个能看见顶面的角度。"""
     color, depth = _scene(140, 180, 100, 140)
     adjustment = plan_view(
         color, depth, _intr(), COLORS, gravity=np.array([0.0, 1.0, 0.0]), recognized=False
@@ -106,19 +107,19 @@ def test_unrecognized_on_axis_pitches_down():
     body = adjustment.as_dict()
     assert body["seek_pitch"]["direction"] == "down"
     assert body["seek_yaw"]["direction"] == "none"
-    assert abs(body["seek_pitch"]["degrees"] - 2.5) < 1e-6
+    assert abs(body["seek_pitch"]["degrees"] - 5.0) < 1e-6
     assert body["pitch"]["direction"] == "none"
 
 
 def test_unrecognized_while_looking_down_pitches_up():
-    """已经接近正俯视却仍未识别时，改为上仰 2.5°，不再继续往下转。"""
+    """已经接近正俯视却仍未识别时，改为上仰 5°，不再继续往下转。"""
     color, depth = _scene(140, 180, 100, 140)
     adjustment = plan_view(
         color, depth, _intr(), COLORS, gravity=np.array([0.0, 0.0, 1.0]), recognized=False
     )
     body = adjustment.as_dict()
     assert body["seek_pitch"]["direction"] == "up"
-    assert abs(body["seek_pitch"]["degrees"] - 2.5) < 1e-6
+    assert abs(body["seek_pitch"]["degrees"] - 5.0) < 1e-6
     assert body["seek_yaw"]["direction"] == "none"
 
 
@@ -143,7 +144,7 @@ def test_short_miss_does_not_seek():
 
 
 def test_ground_loss_pitches_down_without_yaw():
-    """连续地面失败时只下俯 2.5°，不跟着颜色块做转角。"""
+    """连续地面失败时只下俯 5°，不跟着颜色块做转角。"""
     color, depth = _scene(40, 80, 40, 80)
     adjustment = plan_view(
         color,
@@ -157,9 +158,10 @@ def test_ground_loss_pitches_down_without_yaw():
     body = adjustment.as_dict()
     assert body["reason"] == "ground"
     assert body["seek_pitch"]["direction"] == "down"
-    assert abs(body["seek_pitch"]["degrees"] - 2.5) < 1e-6
+    assert abs(body["seek_pitch"]["degrees"] - 5.0) < 1e-6
     assert body["seek_yaw"]["direction"] == "none"
     assert body["pitch"]["direction"] == "none"
+    assert "footprint_pitch" not in body
 
 
 def test_ground_loss_stops_when_already_low():
@@ -242,7 +244,7 @@ def test_recognition_output_carries_pitch_and_turn():
 
 
 def test_unrecognized_without_color_still_pitches():
-    """红蓝也没分出来、连续未识别时，仍下俯 2.5°，不把两个轴留在 none。"""
+    """红蓝也没分出来、连续未识别时，仍下俯 5°，不把两个轴留在 none。"""
     color = np.full((240, 320, 3), 40, dtype=np.uint8)
     depth = np.full((240, 320), 1.0, dtype=np.float32)
     adjustment = plan_view(color, depth, _intr(), COLORS, gravity=np.array([0.0, 1.0, 0.0]), recognized=False)
@@ -251,7 +253,7 @@ def test_unrecognized_without_color_still_pitches():
     assert body["reason"] == "unrecognized"
     assert body["pitch"]["direction"] == "none"
     assert body["seek_pitch"]["direction"] == "down"
-    assert abs(body["seek_pitch"]["degrees"] - 2.5) < 1e-6
+    assert abs(body["seek_pitch"]["degrees"] - 5.0) < 1e-6
     assert body["seek_yaw"]["direction"] == "none"
 
 
@@ -279,6 +281,192 @@ def test_failed_ground_reuses_last_plane_until_the_camera_turns():
     close = Plane(np.array([0.0, 0.0, 1.0]), 1.01)
     used, kept, left = reuse_stable_plane(close, stable, 1, False, 0.03, 8)
     assert used is close and kept is close and left == 8
+
+
+def test_pitch_below_five_degrees_is_not_commanded():
+    """剩余俯仰额度不够 5° 时这一拍不俯仰。转角不受这条限制。"""
+    color, depth = _scene(40, 80, 40, 80)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 1.0, 0.0]),
+        recognized=False,
+        pitch_room=np.deg2rad(4.0),
+    )
+    body = adjustment.as_dict()
+    assert body["seek_pitch"]["direction"] == "none"
+    assert body["seek_yaw"]["direction"] == "left"
+    assert abs(body["seek_yaw"]["degrees"] - 2.5) < 1e-6
+
+
+def test_small_needed_pitch_still_steps_five_degrees():
+    """几何上只差 3° 时仍给出 5°。更小的俯仰机构执行不了。"""
+    from cube.aim import _pitch_step
+
+    move = _pitch_step(np.deg2rad(3.0), None)
+    assert move.direction == "down"
+    assert abs(move.degrees - 5.0) < 1e-6
+    assert _pitch_step(np.deg2rad(0.3), None).direction == "none"
+    assert _pitch_step(np.deg2rad(-3.0), np.deg2rad(5.0)).direction == "up"
+
+
+def test_footprint_edge_uses_its_own_flags():
+    """绿线贴右边、足迹失败时，向右 2.5°，标志是 footprint_ 而不是 seek_。"""
+    color, depth = _scene(280, 320, 100, 140)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 1.0, 0.0]),
+        recognized=False,
+        footprint_lost=True,
+    )
+    body = adjustment.as_dict()
+    assert body["reason"] == "footprint_edge"
+    assert body["clipped"]["right"]
+    assert body["pitch"]["direction"] == "none"
+    assert body["yaw"]["direction"] == "none"
+    assert "seek_pitch" not in body
+    assert "seek_yaw" not in body
+    assert body["footprint_yaw"]["direction"] == "right"
+    assert abs(body["footprint_yaw"]["degrees"] - 2.5) < 1e-6
+    assert body["footprint_pitch"]["direction"] == "none"
+
+
+def test_footprint_center_nudges_both_axes():
+    """绿线在中间、足迹失败时，下俯 5°，并按默认方向向右扫 2.5°。"""
+    color, depth = _scene(140, 180, 100, 140)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 1.0, 0.0]),
+        recognized=False,
+        footprint_lost=True,
+    )
+    body = adjustment.as_dict()
+    assert body["reason"] == "footprint_center"
+    assert not any(body["clipped"].values())
+    assert body["footprint_pitch"]["direction"] == "down"
+    assert abs(body["footprint_pitch"]["degrees"] - 5.0) < 1e-6
+    assert body["footprint_yaw"]["direction"] == "right"
+    assert abs(body["footprint_yaw"]["degrees"] - 2.5) < 1e-6
+    assert body["sweeping"] is True
+    assert "seek_pitch" not in body
+
+
+def test_footprint_center_follows_horizontal_offset():
+    """绿线没贴边但偏左时，转角向左，俯仰仍是换入射角的那一拍，不跟着上下偏差走。"""
+    color, depth = _scene(40, 80, 100, 140)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 1.0, 0.0]),
+        recognized=False,
+        footprint_lost=True,
+    )
+    body = adjustment.as_dict()
+    assert body["reason"] == "footprint_center"
+    assert body["footprint_yaw"]["direction"] == "left"
+    assert abs(body["footprint_yaw"]["degrees"] - 2.5) < 1e-6
+    assert body["footprint_pitch"]["direction"] == "down"
+    assert abs(body["footprint_pitch"]["degrees"] - 5.0) < 1e-6
+
+
+def test_footprint_center_bias_can_point_left():
+    """光轴上的绿线按给定的扫掠方向转。负号是向左。"""
+    color, depth = _scene(140, 180, 100, 140)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 1.0, 0.0]),
+        recognized=False,
+        footprint_lost=True,
+        yaw_bias=-1.0,
+    )
+    body = adjustment.as_dict()
+    assert body["footprint_yaw"]["direction"] == "left"
+    assert body["footprint_yaw"]["signed_radians"] < 0.0
+
+
+def test_footprint_center_looking_down_pitches_up():
+    """已经接近正俯视时，中间的足迹恢复改为上仰 5°，转角仍扫。"""
+    color, depth = _scene(140, 180, 100, 140)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 0.0, 1.0]),
+        recognized=False,
+        footprint_lost=True,
+    )
+    body = adjustment.as_dict()
+    assert body["reason"] == "footprint_center"
+    assert body["footprint_pitch"]["direction"] == "up"
+    assert abs(body["footprint_pitch"]["degrees"] - 5.0) < 1e-6
+    assert body["footprint_yaw"]["direction"] == "right"
+
+
+def test_ground_loss_beats_footprint_flags():
+    """地面本身没了时仍只下俯，不用足迹恢复的标志。"""
+    color, depth = _scene(40, 80, 40, 80)
+    adjustment = plan_view(
+        color,
+        depth,
+        _intr(),
+        COLORS,
+        gravity=np.array([0.0, 1.0, 0.0]),
+        recognized=False,
+        ground_lost=True,
+        footprint_lost=True,
+    )
+    body = adjustment.as_dict()
+    assert body["reason"] == "ground"
+    assert "footprint_pitch" not in body
+    assert body["seek_yaw"]["direction"] == "none"
+
+
+def test_contour_stability_and_yaw_reversal():
+    """连续 6 帧重心和面积都靠近才算停住。贴右边或扫满 15° 之后，中间的转角改为向左。"""
+    from cube.aim import contour_is_stable, contour_jumped, update_footprint_yaw_sign
+
+    steady = [(100.0, 80.0, 400)] * 6
+    assert contour_is_stable(steady, 6)
+    assert not contour_is_stable(steady[:5], 6)
+    assert not contour_is_stable([(100.0, 80.0, 400)] * 5 + [None], 6)
+    jumped = [(100.0, 80.0, 400)] * 5 + [(140.0, 80.0, 400)]
+    assert not contour_is_stable(jumped, 6)
+    assert contour_jumped((100.0, 80.0, 400), (250.0, 80.0, 400))
+    assert not contour_jumped((100.0, 80.0, 400), (150.0, 80.0, 400))
+    sign, total = update_footprint_yaw_sign(1.0, {"left": False, "right": True, "top": False, "bottom": False}, 0.2, 1.0)
+    assert sign < 0.0 and total == 0.2
+    sign, total = update_footprint_yaw_sign(
+        1.0, None, np.deg2rad(15.0), np.deg2rad(15.0), "footprint_center", sweeping=True
+    )
+    assert sign < 0.0 and total == 0.0
+    sign, total = update_footprint_yaw_sign(
+        1.0, None, np.deg2rad(15.0), np.deg2rad(15.0), "footprint_center", sweeping=False
+    )
+    assert sign > 0.0 and total == np.deg2rad(15.0)
+    sign, total = update_footprint_yaw_sign(1.0, None, np.deg2rad(15.0), np.deg2rad(15.0), "unrecognized")
+    assert sign > 0.0 and total == np.deg2rad(15.0)
+
+
+def test_fresh_reject_names_the_new_reason():
+    """调试画面用这一帧新增加的拒绝原因，不用累计里更早的那一项。"""
+    from main import _fresh_reject
+
+    assert _fresh_reject({"mask": 3}, {"mask": 3, "height": 1}) == "height"
+    assert _fresh_reject({"height": 2}, {"height": 2}) is None
 
 
 def test_no_cube_does_not_move():

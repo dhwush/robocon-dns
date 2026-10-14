@@ -20,7 +20,13 @@ import numpy as np
 import yaml
 
 from camera.source import Frame, RealSenseSource, color_lock_from_config, filter_depth, list_camera_serials
-from cube.aim import plan_view
+from cube.aim import (
+    color_blob,
+    contour_is_stable,
+    contour_jumped,
+    plan_view,
+    update_footprint_yaw_sign,
+)
 from cube.detect import (
     calibrate_hsv,
     detect_cube_candidates,
@@ -206,6 +212,7 @@ def estimate_candidates(
     if not _ground_up_ok(plane, rotation, initial_up):
         _bump(rejects, "world_up")
         return []
+    local_rejects: dict[str, int] = {}
     poses = detect_cube_candidates(
         frame.color,
         depth,
@@ -220,6 +227,7 @@ def estimate_candidates(
         translation=translation,
         zmin=float(cfg["depth_min"]),
         zmax=float(cfg["depth_max"]),
+        rejects=local_rejects,
     )
     if not poses and cfg.get("enable_face_fallback"):
         from cube.face_fallback import fit_when_face_missing
@@ -236,7 +244,8 @@ def estimate_candidates(
         )
         poses = [] if fallback is None else [fallback]
     if not poses:
-        _bump(rejects, "mask")
+        reason = next(iter(local_rejects), "mask")
+        _bump(rejects, reason)
         return []
     worlds = []
     for pose in poses[:3]:
@@ -457,6 +466,22 @@ def seek_ready(miss_frames: int, ground_miss: int, need: int = 6) -> tuple[bool,
     return armed, armed and int(ground_miss) >= int(need)
 
 
+def _fresh_reject(before: dict, after: dict) -> str | None:
+    # 这一帧新增加的拒绝原因。计数没变就没有。
+    found = None
+    for key, count in after.items():
+        if int(count) > int(before.get(key, 0)):
+            found = key
+    return found
+
+
+def _axis_delta(view: dict, key: str) -> float:
+    move = view.get(key) or {}
+    if move.get("direction") in (None, "none"):
+        return 0.0
+    return float(move.get("signed_radians", 0.0))
+
+
 def _view_for_frame(
     color: np.ndarray,
     depth: np.ndarray,
@@ -466,11 +491,14 @@ def _view_for_frame(
     recognized: bool,
     seek: bool,
     ground_lost: bool = False,
+    footprint_lost: bool = False,
     pitch_room: float | None = None,
     yaw_room: float | None = None,
+    yaw_bias: float = 1.0,
 ) -> dict:
     # 已经识别出来时，只有被画面边切到才给 pitch、yaw。
-    # 连续几帧没有位姿之后，才用 seek_ 做每拍 2.5° 的微调。
+    # 连续几帧没有位姿之后，转角每拍最多 2.5°，俯仰只要还要转就是 5°。
+    # 绿线稳定而足迹失败时改走 footprint_，不和 seek_ 混用。
     return plan_view(
         color,
         depth,
@@ -483,8 +511,10 @@ def _view_for_frame(
         recognized=recognized,
         seek=seek,
         ground_lost=ground_lost,
+        footprint_lost=footprint_lost,
         pitch_room=pitch_room,
         yaw_room=yaw_room,
+        yaw_bias=yaw_bias,
     ).as_dict()
 
 
@@ -500,6 +530,7 @@ def _show_test_view(
     fps: float,
     color_lock: dict | None,
     rival_masks: list | None = None,
+    frame_reject: str | None = None,
 ) -> bool:
     # 和 view_cube_center 同一套画面：橙线是地面，绿线是颜色轮廓，青线是足迹，黄十字是体心。
     # 没有显示器时不打断取流。按下 q 或 Esc 时返回真，调用方结束循环。
@@ -539,7 +570,7 @@ def _show_test_view(
     if plane is None:
         lines.append("no ground")
     elif corners is None:
-        lines.append("no cube")
+        lines.append("no cube" if not frame_reject else f"no cube ({frame_reject})")
     else:
         pixels = []
         for corner in np.asarray(corners, dtype=float):
@@ -581,6 +612,13 @@ def _show_test_view(
             f"seek pitch {seek_pitch.get('direction', 'none')} {float(seek_pitch.get('degrees', 0)):.1f}"
             f"  seek turn {seek_turn.get('direction', 'none')} {float(seek_turn.get('degrees', 0)):.1f}"
         )
+    foot_pitch = view.get("footprint_pitch") or {}
+    foot_turn = view.get("footprint_yaw") or {}
+    if foot_pitch.get("direction") not in (None, "none") or foot_turn.get("direction") not in (None, "none"):
+        lines.append(
+            f"footprint pitch {foot_pitch.get('direction', 'none')} {float(foot_pitch.get('degrees', 0)):.1f}"
+            f"  footprint turn {foot_turn.get('direction', 'none')} {float(foot_turn.get('degrees', 0)):.1f}"
+        )
     _label(vis, lines)
     half = (vis.shape[1] // 2, vis.shape[0] // 2)
     preview = np.hstack(
@@ -601,7 +639,8 @@ def _show_test_view(
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
 # field 模式从起步相机跟踪：场地边能看见就校正，看不见就用视觉，视觉也失败再靠陀螺仪，超过 track_hold_s 停止输出。
 # 合格样本满 min_samples 帧才输出位姿。已经识别出来时，只有方块被画面边切掉才给出俯仰和原地转角。
-# 连续 seek_miss_frames 帧没有位姿，才用 seek_pitch、seek_yaw 每拍微调最多 2.5°。
+# 连续 seek_miss_frames 帧没有位姿，才微调。转角每拍最多 2.5°，俯仰只要还要转就是 5°。
+# 地面还在、绿线连续停在一处、足迹失败时，改输出 footprint_pitch、footprint_yaw。
 # 相机没转时，地面拟合失败或原点跳变的几帧沿用上一块合格平面。一开始俯仰或原地转就丢掉它。
 # 地面或外参平移跳过 30 mm 时清空缓冲。
 # 失败后 0.5 s 内重复上一结果，再失败则输出空对象。丢帧原因累加后写到标准错误。
@@ -678,6 +717,12 @@ def run_live(
     ground_miss = 0
     seek_pitch_sum = 0.0
     seek_yaw_sum = 0.0
+    contour_samples: list = []
+    footprint_hold = False
+    footprint_yaw_sign = 1.0
+    last_footprint_clipped = None
+    last_footprint_reason = None
+    last_footprint_sweep = False
     seek_need = int(cfg.get("seek_miss_frames", 6))
     ground_hold_frames = int(cfg.get("ground_hold_frames", 8))
     seek_limit = float(np.deg2rad(float(cfg.get("seek_limit_deg", 15.0))))
@@ -747,6 +792,7 @@ def run_live(
                 ground_hold_frames,
             )
             turning = False
+            reject_before = dict(rejects)
             if tracker is not None:
                 up = None if frame.gravity is None else -frame.gravity
                 if not tracker.started:
@@ -778,6 +824,7 @@ def run_live(
                 worlds = estimate_candidates(
                     frame, intr, cfg, rotation, translation, rejects, initial_up, plane
                 )
+            frame_reject = None if worlds else _fresh_reject(reject_before, rejects)
             origin = None
             if worlds:
                 origin = np.asarray(worlds[0].pop("plane_origin"), dtype=float)
@@ -848,18 +895,47 @@ def run_live(
                         payload = last_record
             aim_gravity = frame.gravity if frame.gravity is not None else gravity
             pose_ok = sample is not None or replay is not None
+            blob = None
             if pose_ok:
                 miss_frames = 0
                 ground_miss = 0
                 seek_pitch_sum = 0.0
                 seek_yaw_sum = 0.0
+                contour_samples.clear()
+                footprint_hold = False
+                footprint_yaw_sign = 1.0
+                last_footprint_clipped = None
+                last_footprint_reason = None
+                last_footprint_sweep = False
             else:
                 miss_frames += 1
                 if plane is None:
                     ground_miss += 1
                 else:
                     ground_miss = 0
+                    blob = color_blob(frame.color, cfg["colors"])
+                contour_samples.append(blob)
+                contour_samples[:] = contour_samples[-seek_need:]
             armed, ground_lost = seek_ready(miss_frames, ground_miss, seek_need)
+            stable = contour_is_stable(contour_samples, seek_need)
+            previous_blob = contour_samples[-2] if len(contour_samples) >= 2 else None
+            jumped = contour_jumped(previous_blob, blob)
+            if pose_ok or ground_lost or plane is None or blob is None:
+                footprint_hold = False
+            elif stable or (footprint_hold and not jumped):
+                footprint_hold = True
+            else:
+                footprint_hold = False
+            footprint_lost = bool(footprint_hold and armed and not ground_lost)
+            if footprint_lost:
+                footprint_yaw_sign, seek_yaw_sum = update_footprint_yaw_sign(
+                    footprint_yaw_sign,
+                    last_footprint_clipped,
+                    seek_yaw_sum,
+                    seek_limit,
+                    last_footprint_reason,
+                    last_footprint_sweep,
+                )
             pitch_room = max(0.0, seek_limit - abs(seek_pitch_sum))
             yaw_room = max(0.0, seek_limit - abs(seek_yaw_sum))
             view = _view_for_frame(
@@ -871,16 +947,26 @@ def run_live(
                 pose_ok,
                 armed,
                 ground_lost=ground_lost,
+                footprint_lost=footprint_lost,
                 pitch_room=pitch_room,
                 yaw_room=yaw_room,
+                yaw_bias=footprint_yaw_sign,
             )
-            seek_pitch = view.get("seek_pitch") or {}
-            seek_turn = view.get("seek_yaw") or {}
-            if seek_pitch.get("direction") not in (None, "none"):
-                seek_pitch_sum += float(seek_pitch.get("signed_radians", 0.0))
+            if view.get("reason") in ("footprint_edge", "footprint_center"):
+                last_footprint_clipped = dict(view.get("clipped") or {})
+                last_footprint_reason = view.get("reason")
+                last_footprint_sweep = bool(view.get("sweeping"))
+            else:
+                last_footprint_clipped = None
+                last_footprint_reason = None
+                last_footprint_sweep = False
+            pitch_delta = _axis_delta(view, "seek_pitch") + _axis_delta(view, "footprint_pitch")
+            yaw_delta = _axis_delta(view, "seek_yaw") + _axis_delta(view, "footprint_yaw")
+            if pitch_delta != 0.0:
+                seek_pitch_sum += pitch_delta
                 turning = True
-            if seek_turn.get("direction") not in (None, "none"):
-                seek_yaw_sum += float(seek_turn.get("signed_radians", 0.0))
+            if yaw_delta != 0.0:
+                seek_yaw_sum += yaw_delta
                 turning = True
             if turning:
                 # 下一帧画面已经跟着转，不能再把点投到转之前的地面上。
@@ -915,6 +1001,7 @@ def run_live(
                 vis_fps,
                 color_lock,
                 rival_masks,
+                frame_reject,
             ):
                 return
             if rejects != logged_rejects:

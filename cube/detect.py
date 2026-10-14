@@ -1306,13 +1306,21 @@ def detect_cube_candidates(
     translation: np.ndarray | None = None,
     zmin: float = 0.3,
     zmax: float = 3.0,
+    rejects: dict | None = None,
 ) -> list[CubePose]:
     # 最多 3 块各自做足迹。绿线可以在这几块之间跳，选择留到多帧比较。
+    # 一块都没通过时只记第一个拒绝原因，不把 height 和后面的 mask 叠在同一帧上。
     prepared_list = prepare_candidate_masks(
         color_bgr, depth, colors, zmin, zmax, plane, intr, cube_size
     )
+    if not prepared_list:
+        if rejects is not None:
+            rejects["mask"] = int(rejects.get("mask", 0)) + 1
+        return []
     poses: list[CubePose] = []
+    first_reason: str | None = None
     for prepared in prepared_list[:3]:
+        local: dict[str, int] = {}
         pose = detect_visible_cube(
             color_bgr,
             depth,
@@ -1327,10 +1335,16 @@ def detect_cube_candidates(
             translation=translation,
             zmin=zmin,
             zmax=zmax,
+            rejects=local,
             prepared=prepared,
         )
         if pose is None:
+            if first_reason is None and local:
+                first_reason = next(iter(local))
             continue
         pose.mask = prepared[0]
         poses.append(pose)
+    if not poses and rejects is not None:
+        reason = first_reason or "mask"
+        rejects[reason] = int(rejects.get(reason, 0)) + 1
     return poses
