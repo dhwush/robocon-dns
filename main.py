@@ -118,7 +118,7 @@ def _acquire_plane(depth: np.ndarray, intr, cfg: dict, gravity: np.ndarray, held
     stride = int(cfg.get("ground_stride", 8))
     thresh = float(cfg["ground_ransac_thresh"])
     max_angle = float(cfg["ground_max_angle_deg"])
-    cloud = sample_points(depth, intr, stride=stride)
+    cloud = sample_points(depth, intr, stride=stride, gravity=gravity)
     if held is not None and plane_holds(cloud, held, gravity, thresh, max_angle):
         return held
     return fit_ground(
@@ -757,7 +757,7 @@ def run_live(
                 # 没有加速度计时才用这个方向。图像向下当重力，只为场地边标定能拟合地面，不是 2.3 的旋转矩阵。
                 gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
                 plane = fit_ground(
-                    sample_points(depth, intr, stride=int(cfg.get("ground_stride", 8))),
+                    sample_points(depth, intr, stride=int(cfg.get("ground_stride", 8)), gravity=gravity),
                     gravity,
                     thresh=float(cfg["ground_ransac_thresh"]),
                     max_angle_deg=float(cfg["ground_max_angle_deg"]),

@@ -140,7 +140,7 @@ def main() -> None:
             frame = source.read()
             depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
             gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
-            cloud = sample_points(depth, intr, stride=stride)
+            cloud = sample_points(depth, intr, stride=stride, gravity=gravity)
             if held_plane is not None and plane_holds(cloud, held_plane, gravity, thresh, max_angle):
                 plane = held_plane
             else:

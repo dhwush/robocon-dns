@@ -45,7 +45,8 @@ class Plane:
 
 
 # --- RANSAC 拟合 --------------------------------------------------------------
-# 三点定一个平面，丢掉和重力夹角过大的假设。
+# 三点定一个平面，丢掉和重力夹角过大的假设。倾角仍不得超过 8°。
+# 票数按地面上的格子计，近处挤在一起的像素不能把法向拉斜。
 # 方块顶面和地面平行，所以在通过重力检查的候选里取最低的一层，避免把顶面当成地面。
 
 def _plane_from_three(points: np.ndarray) -> tuple[np.ndarray, float] | None:
@@ -83,6 +84,77 @@ def _refit(points: np.ndarray) -> tuple[np.ndarray, float]:
     return normal, offset
 
 
+# 地面上大约 8 cm 一格。同一格里的像素再多，也只算一票，近处地面就不能盖过方块旁边那一片。
+_CELL_M = 0.08
+
+
+def _up_vector(gravity: np.ndarray) -> np.ndarray:
+    up = -np.asarray(gravity, dtype=float)
+    return up / np.linalg.norm(up)
+
+
+def _cell_weights(points: np.ndarray, up: np.ndarray) -> np.ndarray:
+    # 投影到水平面后按格子计数。一格的总权重是 1，格子里的点平分这一票。
+    height = points @ up
+    flat = points - height[:, None] * up
+    helper = np.array([1.0, 0.0, 0.0]) if abs(float(up[0])) < 0.9 else np.array([0.0, 1.0, 0.0])
+    axis_x = np.cross(helper, up)
+    axis_x = axis_x / np.linalg.norm(axis_x)
+    axis_y = np.cross(up, axis_x)
+    u = np.floor(flat @ axis_x / _CELL_M).astype(np.int64)
+    v = np.floor(flat @ axis_y / _CELL_M).astype(np.int64)
+    key = u * np.int64(73856093) ^ v * np.int64(19349663)
+    _unique, inverse, counts = np.unique(key, return_inverse=True, return_counts=True)
+    return 1.0 / counts[inverse].astype(float)
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return 0.0
+    total = float(np.asarray(weights, dtype=float).sum())
+    if total <= 1e-9:
+        return float(np.median(values))
+    order = np.argsort(values)
+    cumulative = np.cumsum(np.asarray(weights, dtype=float)[order])
+    index = int(np.searchsorted(cumulative, 0.5 * total, side="left"))
+    return float(values[order][min(index, values.size - 1)])
+
+
+def _prior_offset(points: np.ndarray, up: np.ndarray, weights: np.ndarray) -> float:
+    # 低处那一层的加权中位高度。方块顶面更高，进不了这一层，密集的近处点也不能靠数量把高度拉走。
+    height = points @ up
+    cutoff = float(np.percentile(height, 40))
+    low = height <= cutoff
+    if int(low.sum()) < 30:
+        low = np.ones(len(points), dtype=bool)
+    return _weighted_median(height[low], weights[low])
+
+
+def _ground_band(points: np.ndarray, up: np.ndarray, offset: float, max_angle_deg: float) -> np.ndarray:
+    # 相对先验高度，倾角在 8° 以内时点还可能落在地面上。带外的墙和方块顶面不参与比例。
+    height = points @ up
+    horizontal = np.linalg.norm(points - height[:, None] * up, axis=1)
+    slack = np.maximum(0.08, horizontal * np.sin(np.deg2rad(max_angle_deg)))
+    return np.abs(height - offset) <= slack
+
+
+def _accept_inliers(
+    inliers: np.ndarray,
+    band: np.ndarray,
+    weights: np.ndarray,
+    point_count: int,
+) -> bool:
+    # 至少 30 个点，并且格子票数达到地面带的 5%。只贴住近处一条的平面过不了后面的票数比较。
+    count = int(inliers.sum())
+    if count < max(30, int(0.05 * point_count)):
+        return False
+    band_mass = float(weights[band].sum())
+    if band_mass <= 1e-9:
+        return True
+    return float(weights[inliers & band].sum()) >= 0.05 * band_mass
+
+
 def fit_ground(
     points: np.ndarray,
     gravity: np.ndarray,
@@ -91,42 +163,58 @@ def fit_ground(
     iterations: int = 200,
     seed: int = 0,
 ) -> Plane | None:
-    # 近似水平的候选里取最低一层。方块顶面和地面都水平，取最低的才不会把顶面当成地面。
+    # 法向以重力的反方向为先验，倾角仍不得超过 8°。票数按地面格子计，不按像素计。
     pts = np.asarray(points, dtype=float)
     if len(pts) < 3:
         return None
-    up = -np.asarray(gravity, dtype=float)
-    up = up / np.linalg.norm(up)
+    up = _up_vector(gravity)
+    weights = _cell_weights(pts, up)
+    offset0 = _prior_offset(pts, up, weights)
+    band = _ground_band(pts, up, offset0, max_angle_deg)
+    band_index = np.flatnonzero(band)
+    if band_index.size < 3:
+        band_index = np.arange(len(pts))
+        band = np.ones(len(pts), dtype=bool)
+    candidates: list[tuple[float, float, np.ndarray]] = []
+
+    def consider(normal: np.ndarray, offset: float, inliers: np.ndarray) -> None:
+        normal, offset, angle = _orient_up(normal, offset, gravity)
+        if angle > max_angle_deg or not _accept_inliers(inliers, band, weights, len(pts)):
+            return
+        # 偏移用内点的中位高度，倾斜的假平面不能把锚点抛远。
+        offset = float(np.median(pts[inliers] @ normal))
+        inliers = np.abs(pts @ normal - offset) < thresh
+        if not _accept_inliers(inliers, band, weights, len(pts)):
+            return
+        height = float(np.median(pts[inliers] @ up))
+        mass = float(weights[inliers & band].sum())
+        candidates.append((height, mass, inliers))
+
+    horizontal = np.abs(pts @ up - offset0) < thresh
+    consider(up, offset0, horizontal)
     rng = np.random.default_rng(seed)
-    n = len(pts)
-    candidates: list[tuple[float, np.ndarray, float, np.ndarray]] = []
     for _ in range(iterations):
-        choice = rng.choice(n, size=3, replace=False)
+        choice = rng.choice(band_index, size=3, replace=False)
         fitted = _plane_from_three(pts[choice])
         if fitted is None:
             continue
         normal, offset = fitted
         normal, offset, angle = _orient_up(normal, offset, gravity)
-        # 墙面、方块侧面和重力夹角大，直接丢掉。通过的只剩近似水平的面。
         if angle > max_angle_deg:
             continue
         inliers = np.abs(pts @ normal - offset) < thresh
-        count = int(inliers.sum())
-        if count < max(30, int(0.05 * n)):
-            continue
-        # 用内点高度而不是平面锚点。倾斜的假平面会把锚点抛到很远。
-        height = float(np.median(pts[inliers] @ up))
-        candidates.append((height, inliers))
+        consider(normal, offset, inliers)
     if not candidates:
         return None
-    # 顶面和地面都水平。取最低的一层，5 cm 以内的候选里再选内点最多的。
+    # 顶面和地面都水平。取最低的一层，5 cm 以内的候选里再选格子票数最多的。
     lowest = min(item[0] for item in candidates)
     near_floor = [item for item in candidates if item[0] <= lowest + 0.05]
-    near_floor.sort(key=lambda item: int(item[1].sum()), reverse=True)
-    for _height, inliers in near_floor:
+    near_floor.sort(key=lambda item: item[1], reverse=True)
+    for _height, _mass, inliers in near_floor:
         normal, offset = _refit(pts[inliers])
         normal, offset, angle = _orient_up(normal, offset, gravity)
         if angle <= max_angle_deg:
+            offset = float(np.median(pts[inliers] @ normal))
             return Plane(normal=normal, offset=offset)
     return None
 
@@ -139,24 +227,34 @@ def plane_holds(
     max_angle_deg: float = 8.0,
 ) -> bool:
     # 上一帧平面还贴着这块点云、法向仍朝上时，直接沿用，不再抽点和 SVD。
-    # 夹角和内点比例与 fit_ground 相同。只看内点数会把已经拧斜的平面粘住。
+    # 格子票数要接近重力先验那一层。只贴住近处一条的平面不能继续沿用。
     pts = np.asarray(points, dtype=float)
     if len(pts) < 3:
         return False
     _normal, _offset, angle = _orient_up(np.asarray(plane.normal, dtype=float), float(plane.offset), gravity)
     if angle > max_angle_deg:
         return False
-    count = int(np.count_nonzero(np.abs(pts @ plane.normal - plane.offset) < thresh))
-    return count >= max(30, int(0.05 * len(pts)))
+    up = _up_vector(gravity)
+    weights = _cell_weights(pts, up)
+    offset0 = _prior_offset(pts, up, weights)
+    band = _ground_band(pts, up, offset0, max_angle_deg)
+    held = np.abs(pts @ plane.normal - plane.offset) < thresh
+    if not _accept_inliers(held, band, weights, len(pts)):
+        return False
+    horizontal = np.abs(pts @ up - offset0) < thresh
+    held_mass = float(weights[held & band].sum())
+    horizontal_mass = float(weights[horizontal & band].sum())
+    if horizontal_mass <= 1e-9:
+        return True
+    return held_mass >= 0.7 * horizontal_mass
 
 
 # --- 深度图抽样 ---------------------------------------------------------------
 # 按已知内参把像素反投影成相机系点，供地面拟合使用。stride 用来减点。
 
-def sample_points(depth: np.ndarray, intr, stride: int = 8) -> np.ndarray:
+def _grid_points(depth: np.ndarray, intr, stride: int) -> np.ndarray:
     from geom.transform import deproject_pixels
 
-    # 隔 stride 个像素取一个，地面拟合不需要全分辨率。
     vs, us = np.mgrid[0 : depth.shape[0] : stride, 0 : depth.shape[1] : stride]
     z = depth[vs, us]
     good = np.isfinite(z)
@@ -164,6 +262,23 @@ def sample_points(depth: np.ndarray, intr, stride: int = 8) -> np.ndarray:
         return np.zeros((0, 3))
     pixels = np.column_stack([us[good].ravel(), vs[good].ravel()])
     return deproject_pixels(pixels, z[good].ravel(), intr)
+
+
+def sample_points(depth: np.ndarray, intr, stride: int = 8, gravity: np.ndarray | None = None) -> np.ndarray:
+    # 隔 stride 个像素取一个，地面拟合不需要全分辨率。
+    # 有重力时再取一套更密的点。格子计票之后，多出来的近处像素不会多算票，远处空格能被补上。
+    coarse = _grid_points(depth, intr, stride)
+    if gravity is None:
+        return coarse
+    fine_stride = max(int(stride) // 2, 1)
+    if fine_stride >= int(stride):
+        return coarse
+    fine = _grid_points(depth, intr, fine_stride)
+    if len(fine) == 0:
+        return coarse
+    if len(coarse) == 0:
+        return fine
+    return np.vstack([coarse, fine])
 
 
 def reuse_stable_plane(

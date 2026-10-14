@@ -1212,6 +1212,17 @@ def detect_visible_cube(
     points_top = points[top]
     front_top = front_flag[top]
     pixels_top = pixels[top]
+    # 方块外面几厘米对不上这块平面时，深度足迹会落在翘起的面上。这一帧丢掉，不用这张平面做矩形。
+    ground_ok = _ground_under_cube(depth, mask, plane, intr)
+    if not ground_ok:
+        return fail("ground_ring")
+    # 脚下平面贴住时，正面棱的深度和抬高一个边长的平面对不上。这些点留下会把矩形拉向相机。
+    hits = _intersect_lifted_plane(pixels_top, plane, intr, cube_size)
+    agree = np.isfinite(hits[:, 2]) & (np.abs(hits[:, 2] - points_top[:, 2]) < _RAY_DEPTH_AGREE_M)
+    if int(agree.sum()) >= 20:
+        points_top = points_top[agree]
+        front_top = front_top[agree]
+        pixels_top = pixels_top[agree]
     keep = _drop_near_camera(points_top, plane, 0.05)
     old = _rectangle_on_plane(
         points_top[keep],
@@ -1238,7 +1249,6 @@ def detect_visible_cube(
     )
     ray_front = None if ray is None or new is None else ray[1]
     # 测到的深度和射线交点差不多时，位置差来自棱上的点，不是顶面深度偏了。这种差不改用射线。
-    ground_ok = _ground_under_cube(depth, mask, plane, intr)
     # 中心差过 2 cm 才算两套足迹真正不一致。这时不取中点：脚下贴着平面、并且深度确实偏了，才信射线。
     # 中心还接近，或深度并没有偏，留深度投影。射线会把平面上几毫米的高度误差放大到足迹上。
     center_gap = 0.0 if old is None or new is None else float(np.linalg.norm(old[0] - new[0]))

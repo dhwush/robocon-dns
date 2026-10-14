@@ -1,0 +1,3 @@
+python main.py --mode basic --light indoor
+
+python view_cube_center.py --light indoor 

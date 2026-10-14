@@ -84,6 +84,19 @@ def test_ground_rejects_tilted_normal():
     assert fit_ground(tilted, gravity, max_angle_deg=8.0) is None
 
 
+def test_dense_near_strip_does_not_tilt_the_floor():
+    """近处一小块偏近 4 cm、像素很多，远处真地面更稀。平面应留在真地面上，倾角小于 3°。"""
+    rng = np.random.default_rng(0)
+    far = rng.uniform([-0.6, -0.6, 1.2], [0.6, 0.6, 1.2], size=(200, 3))
+    near = rng.uniform([0.7, -0.15, 1.16], [1.0, 0.15, 1.16], size=(2000, 3))
+    plane = fit_ground(np.vstack([far, near]), np.array([0.0, 0.0, 1.0]), thresh=0.015, max_angle_deg=8.0)
+    assert plane is not None
+    up = np.array([0.0, 0.0, -1.0])
+    cosine = float(np.clip(plane.normal @ up, -1.0, 1.0))
+    assert np.degrees(np.arccos(cosine)) < 3.0
+    assert abs(plane.signed_distance(np.array([0.0, 0.0, 1.2]))) < 0.02
+
+
 def test_visible_cube_pose_within_tolerance():
     """俯视 0.7 m 渲染一个带 4 mm 深度噪声的 0.2 m 方块。可见面检测的底面中心误差要小于 3 cm，
     yaw 按 90° 对称折返后与真值相差小于 3°。"""
@@ -298,7 +311,7 @@ def test_mask_stays_on_cube_when_background_is_raised():
 
 def test_ray_when_ground_holds_depth_when_plane_is_high():
     """俯视、顶面深度只偏 1 cm 多时，足迹中心移动不到 2 cm，仍用深度投影。
-    平面整体抬高之后脚下对不上，也退回深度投影，不能用这张平面做射线。"""
+    平面整体抬高之后脚下对不上，这一帧丢掉，不用这张平面做足迹。"""
     from geom.transform import deproject_pixels
 
     intr = intrinsics_for(320, 240)
@@ -350,8 +363,7 @@ def test_ray_when_ground_holds_depth_when_plane_is_high():
         min_footprint_fraction=0.35,
         size_tolerance=float(cfg["size_tolerance"]),
     )
-    assert pose_depth is not None
-    assert pose_depth.source == "depth"
+    assert pose_depth is None
 
 
 def test_field_corner_recovers_extrinsic(tmp_path):
