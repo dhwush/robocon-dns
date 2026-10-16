@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from camera.source import Frame, filter_depth
-from field.extrinsic import calibrate_from_image
+from field.extrinsic import calibrate_from_image, level_extrinsic
 from fuse.median import average_scores, score_trial
 from geom.transform import fold_yaw_quarter, load_intrinsics_for_serial, project_points, world_to_camera
 from ground.plane import fit_ground, sample_points
@@ -139,7 +139,11 @@ def write_scenes(intr) -> None:
             seed=case["seed"],
         )
         save_rgbd(SCENE_DIR, case["name"], color, depth)
-        _write_gt(case["name"], case["cube"])
+        # 图仍按俯视光学系画。真值改到水平世界系：向前是光学 Y 的反向，yaw 跟着反号。
+        flat = dict(case["cube"])
+        flat["y"] = -float(flat["y"])
+        flat["yaw"] = -float(flat["yaw"])
+        _write_gt(case["name"], flat)
     for station in advanced_stations():
         color, depth = render_field(
             intr,
@@ -320,11 +324,10 @@ def test_exam_images_match_assignment():
 
     basic_trials = []
     gravity = np.array([0.0, 0.0, 1.0])
-    identity_r = np.eye(3)
-    identity_t = np.zeros(3)
+    level_r, level_t = level_extrinsic(gravity)
     for case in basic_cases():
         gt = _read_gt(case["name"])
-        est = estimate_frame(_frame(case["name"], gravity, cfg), intr, cfg, identity_r, identity_t)
+        est = estimate_frame(_frame(case["name"], gravity, cfg), intr, cfg, level_r, level_t)
         trial = _score_pose(est, gt)
         basic_trials.append(trial)
         _basic_overlay(intr, case["name"], gt, trial)

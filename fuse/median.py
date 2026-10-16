@@ -2,8 +2,8 @@
 
 位置用中值。无标记方块的 yaw 先按 90° 展开成连续角再取中值，输出前折回主值区间，
 避免 ±45° 两侧被当成两个朝向。离群帧用绝对中位差丢掉。
-x、y 分开计相对误差。真值绝对值小于 0.15 m 时分母仍用 0.15 m，只避免百分比被小坐标放大，
-并在结果里标出 sensitive_percent；这个下限不代表测量可以放宽。
+x、y 分开计相对误差，分母就是真值绝对值。真值小于 0.15 m 时只在结果里标出
+sensitive_percent，不把分母抬到 0.15 m。
 <5% 为 4 分，之后每 5% 降 1 分。x/y 的得分再取平均。基础要求两项都到 4 分才算通过。
 """
 
@@ -85,9 +85,13 @@ def fuse_poses(samples: list[dict], mad_scale: float = 3.0) -> FusedPose | None:
 # --- 评分 ---------------------------------------------------------------------
 # 基础要求要先达到 4 分，才进入提高要求。三次测量取得分的平均。
 
-def _axis_error(est: float, gt: float, floor: float) -> float:
-    # 真值接近 0 时，百分比会被深度噪声放大。0.15 m 只做分母下限，不放宽测量本身。
-    return abs(float(est) - float(gt)) / max(abs(float(gt)), floor)
+def _axis_error(est: float, gt: float) -> float:
+    # 分母用真值本身。真值为 0 且估计也是 0 时误差是 0，否则视为完全偏离。
+    delta = abs(float(est) - float(gt))
+    denom = abs(float(gt))
+    if denom < 1e-9:
+        return 0.0 if delta < 1e-6 else 1.0
+    return delta / denom
 
 
 def angle_delta(est: float, gt: float, quarter: bool) -> float:
@@ -128,13 +132,13 @@ def score_trial(
     # x、y 分开算相对误差再取平均分。真值过小会在结果里标出 sensitive_percent。
     est = np.asarray(est_xy, dtype=float)
     gt = np.asarray(gt_xy, dtype=float)
-    error_x = _axis_error(est[0], gt[0], axis_floor)
-    error_y = _axis_error(est[1], gt[1], axis_floor)
+    error_x = _axis_error(est[0], gt[0])
+    error_y = _axis_error(est[1], gt[1])
     yaw = relative_yaw_error(est_yaw, gt_yaw, quarter=quarter)
     score_x = band_score(error_x)
     score_y = band_score(error_y)
     abs_yaw = angle_delta(est_yaw, gt_yaw, quarter)
-    # 0.15 m 只用于内部告警。真值更小时，5% 已经小于深度噪声，百分比会过敏。
+    # 0.15 m 只标出小坐标，不抬高分母。真值更小时，5% 已经小于深度噪声。
     sensitive = abs(float(gt[0])) < axis_floor or abs(float(gt[1])) < axis_floor
     return {
         "position_error": max(error_x, error_y),

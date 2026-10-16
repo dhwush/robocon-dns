@@ -1,7 +1,8 @@
 """实时查看方块识别和体心。
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
-橙色线是拟合地面上最大的一块，内点放宽到 18 mm。画面写出地面上的前方距离、左右距离和地面 yaw。按 q 或 Esc 退出。
+橙色线是拟合地面上最大的一块，内点放宽到 18 mm。画面写出地面上的前方距离、左右距离和地面 yaw。
+另一行把 ahead 加回 4.5 cm，改到地面标记；标记在光心正后方，right 不变。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
@@ -54,6 +55,14 @@ def _ground_readout(bottom: np.ndarray, plane, edge: np.ndarray, cube_size: floa
     else:
         yaw = fold_yaw_quarter(float(np.arctan2(flat_edge @ forward, flat_edge @ right)))
     return ahead, side, above_top, yaw
+
+
+# 地面标记在光心正后方 4.5 cm。ahead、right 仍相对光心，下面这一行才改到标记。
+MARK_BEHIND_CAMERA_M = 0.045
+
+
+def _origin_readout(ahead: float, right: float) -> tuple[float, float]:
+    return ahead + MARK_BEHIND_CAMERA_M, right
 
 
 def _pixel(point: np.ndarray, intr) -> tuple[int, int] | None:
@@ -221,6 +230,8 @@ def main() -> None:
                         lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
                         lines.append(f"above top={above_top:+.3f} m")
                         lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
+                        origin_ahead, origin_right = _origin_readout(ahead, side)
+                        lines.append(f"origin ahead={origin_ahead:+.3f} m   right={origin_right:+.3f} m")
             _label(vis, lines)
             chart = render_color_standard(
                 cfg["colors"],

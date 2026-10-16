@@ -138,7 +138,8 @@ class MotionTracker:
         self.initial_up = vector / norm
 
     def start(self, color_bgr: np.ndarray, depth: np.ndarray, up_camera: np.ndarray | None = None) -> None:
-        # 第一帧就是世界原点。这一帧之前的陀螺样品丢掉，避免把上电时刻算进位移。
+        # 第一帧光心是世界原点。调用方若要水平世界轴，在 start 之后写入 level_extrinsic。
+        # 这一帧之前的陀螺样品丢掉，避免把上电时刻算进位移。
         self.rotation = np.eye(3)
         self.translation = np.zeros(3)
         self._remember(color_bgr, depth)

@@ -1,7 +1,7 @@
 """用矩形场地的边求相机外参。
 
 世界系原点是靠近相机的那个角，X 沿长边，Y 沿短边，Z 向上。
-基础要求的相机在世界原点，不走这里，直接用单位旋转和零平移。
+基础要求的相机在世界原点，水平轴由 level_extrinsic 从重力定出，不走场地边。
 提高要求只要求挪走相机后仍给出世界系位姿。安装方向和文档 2.3 的水平向前不一致时，
 继续用这里求出的外参，不换成那组固定旋转，也不改用 AprilTag。
 """
@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import yaml
 
-from geom.transform import deproject_pixels
+from geom.transform import Rz, deproject_pixels
 from ground.plane import Plane
 
 
@@ -50,8 +50,30 @@ class Segment:
 # 较长的边对齐世界 X，较短的边对齐世界 Y；Z 由叉乘得到，并翻到与地面法向同侧。
 
 def identity_extrinsic() -> tuple[np.ndarray, np.ndarray]:
-    # 基础要求：相机固定在世界原点。单位阵表示世界系就是相机系，不是文档 2.3 的 R_WC。
+    # 光学系与世界系重合时才用。基础要求的水平世界系用 level_extrinsic。
     return np.eye(3), np.zeros(3)
+
+
+def level_extrinsic(gravity: np.ndarray, yaw: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    # 世界原点在光心。X 向右，Y 向前，Z 向上，都相对起步时的车头。
+    # 重力每帧重定水平。yaw 是已经执行的原地右转，加速度计看不出这个角。
+    # R 的三列是世界轴在当前光学系里的方向，平移为 0：转轴过光心。
+    down = np.asarray(gravity, dtype=float)
+    norm = float(np.linalg.norm(down))
+    if norm < 1e-6:
+        down = np.array([0.0, 1.0, 0.0])
+    else:
+        down = down / norm
+    up = -down
+    optical_x = np.array([1.0, 0.0, 0.0])
+    right = optical_x - float(np.dot(optical_x, up)) * up
+    if float(np.linalg.norm(right)) < 0.25:
+        right = np.cross(np.array([0.0, 0.0, 1.0]), up)
+    right = right / np.linalg.norm(right)
+    forward = np.cross(up, right)
+    forward = forward / np.linalg.norm(forward)
+    level = np.column_stack([right, forward, up])
+    return level @ Rz(float(yaw)), np.zeros(3)
 
 
 def _intersect(seg_a: Segment, seg_b: Segment) -> np.ndarray | None:

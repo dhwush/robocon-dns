@@ -1,8 +1,8 @@
 """入口：由 D435i 的一帧估计地面方块的世界系 x、y 和 yaw。
 
-作业基础要求只要求相机在世界原点，这里用单位旋转和零平移，世界系就是相机系。
-文档 2.3 那组固定旋转只在相机水平向前、光轴对齐场地 X 时成立；安装方向不同，不用那组矩阵。
-提高要求的世界原点仍是起步时的相机。陀螺仪和视觉里程计连续跟踪，场地边看见时校正漂移。
+基础要求里光心是世界原点。世界轴是水平的：向右 X、向前 Y、向上 Z。
+向前锁在起步时的车头，原地转角累加进去；俯仰由重力每帧重定。
+提高要求的世界原点仍是起步时的光心，轴同样先摆成这一套，再用陀螺仪、视觉和场地边跟踪。
 
 方块位置和 yaw 都来自地面足迹，不拟合上表面。上表面 RMS、与地面的 12° 夹角、
 6 mm 正方形残差没有对应平面，不参与丢帧。足迹的长边、短边和面积仍然丢帧。
@@ -40,6 +40,7 @@ from cube.rival import RivalPicker
 from field.extrinsic import (
     calibrate_from_image,
     identity_extrinsic,
+    level_extrinsic,
     save_extrinsic,
 )
 from field.motion import MotionTracker
@@ -71,14 +72,10 @@ def _bump(rejects: dict | None, reason: str) -> None:
 
 
 def _ground_up_ok(plane, rotation: np.ndarray, initial_up: np.ndarray | None = None) -> bool:
-    # 单位外参时世界轴跟着相机走，不拿地面法向去对文档 2.3 的 +Z_W。
-    # 跟踪模式的世界 Z 是起步时光轴，不是竖直向上。法向要回到起步时记下的向上方向。
-    # 没有这个记录、外参又不是单位阵时，仍要求世界 Z 向上，供自检里的场地边外参使用。
+    # 世界 Z 向上。地面法向变回世界系后应接近 +Z，倾斜过大约 18° 就丢掉这一帧。
+    # initial_up 保留给调用方，不再拿起步光轴当世界 Z。
+    _ = initial_up
     up = rotation.T @ plane.normal
-    if initial_up is not None:
-        return float(up @ np.asarray(initial_up, dtype=float)) >= 0.95
-    if np.allclose(rotation, np.eye(3), atol=1e-5):
-        return True
     return float(up[2]) >= 0.95
 
 
@@ -87,6 +84,10 @@ def pose_to_world(pose, rotation: np.ndarray, translation: np.ndarray, plane, he
     # 没有上表面，不能按顶面公式再减一次半高。
     center = pose.bottom_center + plane.normal * (0.5 * height)
     world = camera_to_world(center, rotation, translation)
+    # 平面在世界系里的垂足。相机绕光心转或平移时，同一块地面的这个点不动。
+    normal_c = np.asarray(plane.normal, dtype=float)
+    normal_w = rotation.T @ normal_c
+    offset_w = float(plane.offset) - float(normal_c @ np.asarray(translation, dtype=float))
     return {
         "x": float(world[0]),
         "y": float(world[1]),
@@ -95,7 +96,7 @@ def pose_to_world(pose, rotation: np.ndarray, translation: np.ndarray, plane, he
         "inliers": int(pose.inliers),
         "quarter": not pose.front_color,
         "corners_cam": pose.corners,
-        "plane_origin": plane.origin(),
+        "plane_origin": normal_w * offset_w,
     }
 
 
@@ -186,8 +187,6 @@ def estimate_frame(
     if pose is None:
         return None
     world = pose_to_world(pose, rotation, translation, plane, float(cfg["cube_size"]))
-    # 平面上一点用于判断相机或地面是否跳了 30 mm。不写进对外的 JSON。
-    world["plane_origin"] = plane.origin()
     return world
 
 
@@ -250,7 +249,6 @@ def estimate_candidates(
     worlds = []
     for pose in poses[:3]:
         world = pose_to_world(pose, rotation, translation, plane, float(cfg["cube_size"]))
-        world["plane_origin"] = plane.origin()
         world["footprint_fraction"] = float(pose.footprint_fraction)
         world["long_side"] = float(pose.long_side)
         world["short_side"] = float(pose.short_side)
@@ -271,15 +269,15 @@ def self_check(cfg: dict) -> int:
     intr = intrinsics_for(640, 360)
     gravity = np.array([0.0, 0.0, 1.0])
     basic_trials = []
-    # 俯视 0.7 m 时方块要靠近光轴，顶面才会完整落在画面里。坐标仍大于 0.15 m，避免百分比分母被下限托住。
+    # 俯视 0.7 m 时方块要靠近光轴，顶面才会完整落在画面里。渲染仍用光学系，评分换成水平的向前。
     targets = [
         (np.array([0.18, 0.16, 0.7]), 0.35),
         (np.array([-0.20, 0.16, 0.7]), -0.4),
         (np.array([0.16, -0.18, 0.7]), 0.2),
     ]
-    rotation, translation = identity_extrinsic()
-    # 基础：三个俯视方块，外参为单位阵。同一张图重复估计再取中值，模拟多帧。
-    print("basic (camera frame is the world frame)")
+    rotation, translation = level_extrinsic(gravity)
+    # 基础：三个俯视方块。光学 Y 和 yaw 与水平向前相反。同一张图重复估计再取中值。
+    print("basic (level frame: x right, y forward, z up)")
     for center, yaw in targets:
         color, depth = render_cube(
             intr,
@@ -303,21 +301,66 @@ def self_check(cfg: dict) -> int:
                 {"position_score": 0, "yaw_score": 0, "position_error": 1.0, "yaw_error": 1.0}
             )
             continue
+        truth_xy = np.array([center[0], -center[1]])
+        truth_yaw = -yaw
         trial = score_trial(
             np.array([fused.x, fused.y]),
             fused.yaw,
-            center[:2],
-            yaw,
+            truth_xy,
+            truth_yaw,
         )
         basic_trials.append(trial)
         print(
             f"  est=({fused.x:.3f}, {fused.y:.3f}, yaw={fused.yaw:.3f}) "
-            f"gt=({center[0]:.3f}, {center[1]:.3f}, yaw={yaw:.3f}) "
+            f"gt=({truth_xy[0]:.3f}, {truth_xy[1]:.3f}, yaw={truth_yaw:.3f}) "
             f"abs=({trial['abs_x']:.3f}, {trial['abs_y']:.3f}, {trial['abs_yaw']:.3f}) "
             f"pos={trial['position_score']} yaw={trial['yaw_score']}"
         )
         if trial.get("sensitive_percent"):
             print("  真值落在 0.15 m 内，百分比对小坐标过敏")
+    # 光轴下俯 49°。真值在水平世界系，用来确认单位光学系不会再把 y 压到 0。
+    pitch = np.deg2rad(49.0)
+    cosine, sine = np.cos(pitch), np.sin(pitch)
+    pitched_r = np.array(
+        [[1.0, 0.0, 0.0], [0.0, -sine, -cosine], [0.0, cosine, -sine]],
+        dtype=float,
+    )
+    camera_height = np.array([0.0, 0.0, 0.7])
+    pitched_t = -pitched_r @ camera_height
+    pitched_gravity = pitched_r @ np.array([0.0, 0.0, -1.0])
+    leveled_r, _ = level_extrinsic(pitched_gravity)
+    if not np.allclose(leveled_r, pitched_r, atol=1e-6):
+        print("  pitched level extrinsic does not match the 49 deg camera")
+        basic_trials.append({"position_score": 0, "yaw_score": 0, "position_error": 1.0, "yaw_error": 1.0})
+    else:
+        cube_xy = np.array([0.18, 0.55])
+        cube_yaw = np.deg2rad(25.8)
+        color, depth = render_cube_in_world(
+            intr,
+            pitched_r,
+            pitched_t,
+            np.array([cube_xy[0], cube_xy[1], 0.0]),
+            cube_yaw,
+            size=float(cfg["cube_size"]),
+        )
+        sample = estimate_frame(
+            _clean_frame(color, depth, pitched_gravity, cfg),
+            intr,
+            cfg,
+            pitched_r,
+            pitched_t,
+        )
+        if sample is None:
+            print("  pitched cube rejected")
+            basic_trials.append({"position_score": 0, "yaw_score": 0, "position_error": 1.0, "yaw_error": 1.0})
+        else:
+            trial = score_trial(np.array([sample["x"], sample["y"]]), sample["yaw"], cube_xy, cube_yaw)
+            basic_trials.append(trial)
+            print(
+                f"  pitched est=({sample['x']:.3f}, {sample['y']:.3f}, yaw={sample['yaw']:.3f}) "
+                f"gt=({cube_xy[0]:.3f}, {cube_xy[1]:.3f}, yaw={cube_yaw:.3f}) "
+                f"pos={trial['position_score']} yaw={trial['yaw_score']}"
+            )
     summary = average_scores(basic_trials)
     print(
         f"basic average position={summary['position']:.2f} yaw={summary['yaw']:.2f} "
@@ -536,7 +579,15 @@ def _show_test_view(
     # 没有显示器时不打断取流。按下 q 或 Esc 时返回真，调用方结束循环。
     import cv2
 
-    from view_cube_center import _body_center, _cross, _draw_ground, _ground_readout, _label, _pixel
+    from view_cube_center import (
+        _body_center,
+        _cross,
+        _draw_ground,
+        _ground_readout,
+        _label,
+        _origin_readout,
+        _pixel,
+    )
 
     vis = color.copy()
     prepared = None
@@ -596,6 +647,8 @@ def _show_test_view(
             lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
             lines.append(f"above top={above_top:+.3f} m")
             lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
+            origin_ahead, origin_right = _origin_readout(ahead, side)
+            lines.append(f"origin ahead={origin_ahead:+.3f} m   right={origin_right:+.3f} m")
     if pose and "x" in pose:
         lines.append(f"world x={pose['x']:.3f}  y={pose['y']:.3f}  yaw={pose['yaw']:.3f}")
     pitch = view.get("pitch") or {}
@@ -688,6 +741,8 @@ def run_live(
         color_lock=color_lock,
     )
     rotation, translation = identity_extrinsic()
+    # 基础模式已经执行的原地右转。识别成功不清零，俯仰不累加，改由重力重定。
+    executed_yaw = 0.0
     tracker = None
     if mode == "field" and not calibrate:
         tracker = MotionTracker(
@@ -781,7 +836,9 @@ def run_live(
             if tracker is not None:
                 gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
             else:
-                gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
+                # 没有加速度计时按光轴水平：图像向下是重力。俯仰一旦有重力就以它为准。
+                gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
+                rotation, translation = level_extrinsic(gravity, executed_yaw)
             plane_fresh = _acquire_plane(depth, intr, cfg, gravity, None if turning else stable_plane)
             plane, stable_plane, stable_left = reuse_stable_plane(
                 plane_fresh,
@@ -797,6 +854,9 @@ def run_live(
                 up = None if frame.gravity is None else -frame.gravity
                 if not tracker.started:
                     tracker.start(frame.color, depth, up)
+                    if up is not None:
+                        # 起步轴改成向右、向前、向上。之后的陀螺和视觉都相对这套轴积分。
+                        tracker.rotation, tracker.translation = level_extrinsic(-up)
                 else:
                     tracker.begin_frame()
                     tracker.integrate_gyro(frame.gyro or [])
@@ -968,6 +1028,16 @@ def run_live(
             if yaw_delta != 0.0:
                 seek_yaw_sum += yaw_delta
                 turning = True
+            if tracker is None:
+                # 贴边时的整段转角、seek_ 和 footprint_ 都会让车转。限额仍只用后面两项。
+                full_yaw = (
+                    _axis_delta(view, "yaw")
+                    + _axis_delta(view, "seek_yaw")
+                    + _axis_delta(view, "footprint_yaw")
+                )
+                if full_yaw != 0.0:
+                    executed_yaw += full_yaw
+                    turning = True
             if turning:
                 # 下一帧画面已经跟着转，不能再把点投到转之前的地面上。
                 stable_plane = None

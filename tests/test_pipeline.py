@@ -310,8 +310,8 @@ def test_mask_stays_on_cube_when_background_is_raised():
 
 
 def test_ray_when_ground_holds_depth_when_plane_is_high():
-    """俯视、顶面深度只偏 1 cm 多时，足迹中心移动不到 2 cm，仍用深度投影。
-    平面整体抬高之后脚下对不上，这一帧丢掉，不用这张平面做足迹。"""
+    """脚下平面贴住时，顶面深度偏 1 cm 多仍用射线交点，中心移动不到 3 cm。
+    平面整体抬高之后脚下对不上，这一帧丢掉。"""
     from geom.transform import deproject_pixels
 
     intr = intrinsics_for(320, 240)
@@ -349,7 +349,7 @@ def test_ray_when_ground_holds_depth_when_plane_is_high():
         size_tolerance=float(cfg["size_tolerance"]),
     )
     assert pose is not None
-    assert pose.source == "depth"
+    assert pose.source == "ray"
     assert np.linalg.norm(pose.bottom_center[:2] - center[:2]) < 0.03
     raised = Plane(normal=plane.normal.copy(), offset=float(plane.offset) + 0.02)
     pose_depth = detect_visible_cube(
@@ -408,8 +408,12 @@ def test_fuse_and_score_bands():
     assert trial["position_score"] == 4
     summary = average_scores([trial, trial, trial])
     assert summary["basic_passed"]
-    # 真值 y = 0 落在 0.15 m 以内，百分比会过敏，评分分母仍用这个下限。
+    # 真值 y = 0 只标出小坐标。分母不再抬到 0.15 m：5 cm 上偏 1.2 cm 超过 20%，x 不得分。
     assert trial["sensitive_percent"]
+    small = score_trial(np.array([0.062, 1.0]), 0.0, np.array([0.05, 1.0]), 0.0)
+    assert small["sensitive_percent"]
+    assert small["error_x"] > 0.20
+    assert small["position_score"] == 2
     near = [{"x": 1.0, "y": 0.2, "z": 0.0, "yaw": 0.78, "quarter": True} for _ in range(4)]
     near += [{"x": 1.0, "y": 0.2, "z": 0.0, "yaw": -0.76, "quarter": True} for _ in range(4)]
     folded = fuse_poses(near)

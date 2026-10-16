@@ -54,11 +54,9 @@ _GROUND_SPREAD_M = 0.015
 
 # 射线交点与测到的深度差过这条，像素就在侧面而不是顶面。位置仍用交点，不用测到的深度。
 _RAY_DEPTH_AGREE_M = 0.02
-# 中位深度差超过这条，才认为顶面深度确实偏了，值得改用射线。
-_RAY_BIAS_TRUST_M = 0.016
 # 顶面掩膜只剥掉最外 1 个像素，避开棱上的混合深度。再往里改在平面坐标里裁，避免斜视时把矩形裁歪。
 
-# 新旧足迹中心差过这条，就不折中，按地面是否贴脚下来取舍。
+# 两套足迹中心差过这条就丢帧，不在深度投影和射线之间切换。
 _SCHEME_SPLIT_M = 0.02
 
 
@@ -1136,21 +1134,6 @@ def _rectangle_on_plane(
     return bottom, corners, coords, edge_2d, fraction, float(long_side), float(short_side)
 
 
-def _drop_near_camera(points: np.ndarray, plane: Plane, fraction: float = 0.05) -> np.ndarray:
-    # 投影到地面后，丢掉离相机落点最近的大约 5%。偏近的深度飞点就不会把长边撑出绿线。
-    projected = plane.project(points)
-    cam = plane.project(np.zeros(3))
-    dist = np.linalg.norm(projected - cam, axis=1)
-    drop = int(np.floor(len(points) * fraction))
-    if drop < 1 or len(points) - drop < 3:
-        return np.ones(len(points), dtype=bool)
-    cutoff = np.partition(dist, drop - 1)[drop - 1]
-    keep = dist > cutoff
-    if int(keep.sum()) < 3:
-        keep = dist >= cutoff
-    return keep
-
-
 def detect_visible_cube(
     color_bgr: np.ndarray,
     depth: np.ndarray,
@@ -1206,9 +1189,8 @@ def detect_visible_cube(
     top = body & (height >= peak - TOP_LAYER_BELOW_PEAK_M)
     if int(top.sum()) < 3:
         return fail("height")
-    # 2. 两套足迹。旧的把测到的顶面点压到地面。新的用射线和抬高一个边长的平面求交。
-    # 中心差过 2 cm 时不取平均：方块脚下贴着平面就用新的，贴不上就用旧的。
-    # 中心还接近时留旧的，避免几毫米的平面误差被射线放大。
+    # 2. 两套足迹。深度把测到的顶面点压到地面。射线和抬高一个边长的平面求交，中心用交点的外接矩形。
+    # 射线点够就用射线。两套中心差过 2 cm 时丢帧，不在两套之间切换，避免多帧里出现两个位置。
     points_top = points[top]
     front_top = front_flag[top]
     pixels_top = pixels[top]
@@ -1223,9 +1205,8 @@ def detect_visible_cube(
         points_top = points_top[agree]
         front_top = front_top[agree]
         pixels_top = pixels_top[agree]
-    keep = _drop_near_camera(points_top, plane, 0.05)
     old = _rectangle_on_plane(
-        points_top[keep],
+        points_top,
         plane,
         cube_size,
         min_footprint_fraction,
@@ -1248,20 +1229,15 @@ def detect_visible_cube(
         size_tolerance,
     )
     ray_front = None if ray is None or new is None else ray[1]
-    # 测到的深度和射线交点差不多时，位置差来自棱上的点，不是顶面深度偏了。这种差不改用射线。
-    # 中心差过 2 cm 才算两套足迹真正不一致。这时不取中点：脚下贴着平面、并且深度确实偏了，才信射线。
-    # 中心还接近，或深度并没有偏，留深度投影。射线会把平面上几毫米的高度误差放大到足迹上。
-    center_gap = 0.0 if old is None or new is None else float(np.linalg.norm(old[0] - new[0]))
-    center_split = old is not None and new is not None and center_gap > _SCHEME_SPLIT_M
-    depth_biased = ray is not None and ray[2] > _RAY_BIAS_TRUST_M
-    trust_ray = new is not None and ground_ok and depth_biased and (old is None or center_split)
-    if trust_ray:
+    if old is not None and new is not None and float(np.linalg.norm(old[0] - new[0])) > _SCHEME_SPLIT_M:
+        return fail("footprint_split")
+    if new is not None:
         bottom, corners, coords, edge_2d, fraction, long_side, short_side = new
         front_flag = ray_front
         source = "ray"
     elif old is not None:
         bottom, corners, coords, edge_2d, fraction, long_side, short_side = old
-        front_flag = front_top[keep]
+        front_flag = front_top
         source = "depth"
     else:
         return fail("footprint_long")
