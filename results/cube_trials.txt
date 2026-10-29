@@ -1,0 +1,14 @@
+trial 1
+x_m: -0.279
+y_m: 0.507
+yaw_rad: 0.283
+
+trial 2
+x_m: -0.932
+y_m: -0.234
+yaw_rad: -0.517
+
+trial 3
+x_m: -0.408
+y_m: 0.061
+yaw_rad: -0.774

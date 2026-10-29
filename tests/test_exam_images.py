@@ -324,7 +324,7 @@ def test_exam_images_match_assignment():
 
     basic_trials = []
     gravity = np.array([0.0, 0.0, 1.0])
-    level_r, level_t = level_extrinsic(gravity)
+    level_r, level_t = level_extrinsic(gravity, mounted=False)
     for case in basic_cases():
         gt = _read_gt(case["name"])
         est = estimate_frame(_frame(case["name"], gravity, cfg), intr, cfg, level_r, level_t)

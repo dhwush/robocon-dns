@@ -21,6 +21,17 @@ size_tolerance: 0.06
 frames_to_fuse: 15
 min_samples: 5
 output_hz: 10
+# 一次摆放从开始观察起至少这么久。时间未到时，即使窗口已经稳定也不写结果。
+min_trial_s: 15
+# 连续这么多帧里，x、y 相对中值的偏差都不超过 stable_xy_m，yaw 标准差不超过 stable_yaw_deg。
+stable_frames: 15
+stable_xy_m: 0.010
+stable_yaw_deg: 1.5
+# 写出后，地面中心离开超过这个距离并持续 trial_move_frames 帧，下一次才重新计时。
+trial_move_m: 0.08
+trial_move_frames: 6
+trial_count: 3
+result_path: results/cube_trials.txt
 hold_s: 0.5
 jump_m: 0.03
 fps: 30

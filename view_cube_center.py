@@ -2,7 +2,7 @@
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
 橙色线是拟合地面上最大的一块，内点放宽到 18 mm。画面写出地面上的前方距离、左右距离和地面 yaw。
-另一行把 ahead 加回 4.5 cm，改到地面标记；标记在光心正后方，right 不变。按 q 或 Esc 退出。
+另一行把地面上的前方、右方换到世界坐标。原点是右前角，光心在 x=-0.211 m、y=+0.05 m。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -23,6 +25,7 @@ from cube.detect import (
     render_color_standard,
     show_color_standard,
 )
+from field.extrinsic import OPTICAL_CENTER_IN_WORLD
 from geom.transform import deproject_pixels, fold_yaw_quarter, project_points
 from ground.plane import fit_ground, plane_holds, sample_points
 from main import live_intrinsics, load_config
@@ -57,12 +60,10 @@ def _ground_readout(bottom: np.ndarray, plane, edge: np.ndarray, cube_size: floa
     return ahead, side, above_top, yaw
 
 
-# 地面标记在光心正后方 4.5 cm。ahead、right 仍相对光心，下面这一行才改到标记。
-MARK_BEHIND_CAMERA_M = 0.045
-
-
 def _origin_readout(ahead: float, right: float) -> tuple[float, float]:
-    return ahead + MARK_BEHIND_CAMERA_M, right
+    # ahead、right 相对光心在地面上的正下方。世界原点是右前角，轴与起步时的相机一致。
+    center = OPTICAL_CENTER_IN_WORLD
+    return float(right) + float(center[0]), float(ahead) + float(center[1])
 
 
 def _pixel(point: np.ndarray, intr) -> tuple[int, int] | None:
@@ -86,6 +87,213 @@ def _label(image: np.ndarray, lines: list[str]) -> None:
     for line in lines:
         cv2.putText(image, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
         y += 28
+
+
+_CJK_FONTS = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+)
+_cjk_face = None
+_cjk_size = 0
+
+
+class _FTGeneric(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_void_p), ("finalizer", ctypes.c_void_p)]
+
+
+class _FTVector(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _FTMetrics(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_long) for name in (
+        "width", "height", "horiBearingX", "horiBearingY", "horiAdvance",
+        "vertBearingX", "vertBearingY", "vertAdvance",
+    )]
+
+
+class _FTBitmap(ctypes.Structure):
+    _fields_ = [
+        ("rows", ctypes.c_uint),
+        ("width", ctypes.c_uint),
+        ("pitch", ctypes.c_int),
+        ("buffer", ctypes.c_void_p),
+        ("num_grays", ctypes.c_ushort),
+        ("pixel_mode", ctypes.c_ubyte),
+        ("palette_mode", ctypes.c_ubyte),
+        ("palette", ctypes.c_void_p),
+    ]
+
+
+class _FTGlyph(ctypes.Structure):
+    # 只保留到位图顶部。后面的轮廓字段这一帧用不到。
+    _fields_ = [
+        ("library", ctypes.c_void_p),
+        ("face", ctypes.c_void_p),
+        ("next", ctypes.c_void_p),
+        ("glyph_index", ctypes.c_uint),
+        ("generic", _FTGeneric),
+        ("metrics", _FTMetrics),
+        ("linearHoriAdvance", ctypes.c_long),
+        ("linearVertAdvance", ctypes.c_long),
+        ("advance", _FTVector),
+        ("format", ctypes.c_int),
+        ("bitmap", _FTBitmap),
+        ("bitmap_left", ctypes.c_int),
+        ("bitmap_top", ctypes.c_int),
+    ]
+
+
+class _FTBBox(ctypes.Structure):
+    _fields_ = [("xMin", ctypes.c_long), ("yMin", ctypes.c_long), ("xMax", ctypes.c_long), ("yMax", ctypes.c_long)]
+
+
+class _FTFace(ctypes.Structure):
+    _fields_ = [
+        ("num_faces", ctypes.c_long),
+        ("face_index", ctypes.c_long),
+        ("face_flags", ctypes.c_long),
+        ("style_flags", ctypes.c_long),
+        ("num_glyphs", ctypes.c_long),
+        ("family_name", ctypes.c_char_p),
+        ("style_name", ctypes.c_char_p),
+        ("num_fixed_sizes", ctypes.c_int),
+        ("available_sizes", ctypes.c_void_p),
+        ("num_charmaps", ctypes.c_int),
+        ("charmaps", ctypes.c_void_p),
+        ("generic", _FTGeneric),
+        ("bbox", _FTBBox),
+        ("units_per_EM", ctypes.c_ushort),
+        ("ascender", ctypes.c_short),
+        ("descender", ctypes.c_short),
+        ("height", ctypes.c_short),
+        ("max_advance_width", ctypes.c_short),
+        ("max_advance_height", ctypes.c_short),
+        ("underline_position", ctypes.c_short),
+        ("underline_thickness", ctypes.c_short),
+        ("glyph", ctypes.POINTER(_FTGlyph)),
+    ]
+
+
+def _freetype():
+    library = ctypes.CDLL("libfreetype.so.6")
+    library.FT_Init_FreeType.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    library.FT_New_Face.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.POINTER(ctypes.c_void_p)]
+    library.FT_Set_Pixel_Sizes.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    library.FT_Load_Char.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
+    library.FT_Done_Face.argtypes = [ctypes.c_void_p]
+    return library
+
+
+def _open_cjk(size: int):
+    # Hershey 字体没有汉字。用系统里的思源黑体，经 FreeType 画到画面上。
+    global _cjk_face, _cjk_size
+    if _cjk_face is not None and _cjk_size == size:
+        return _cjk_face
+    path = next((item for item in _CJK_FONTS if Path(item).exists()), None)
+    if path is None:
+        return None
+    try:
+        library = _freetype()
+        handle = ctypes.c_void_p()
+        if library.FT_Init_FreeType(ctypes.byref(handle)) != 0:
+            return None
+        chosen = None
+        for index in range(8):
+            face_ptr = ctypes.c_void_p()
+            if library.FT_New_Face(handle, path.encode(), index, ctypes.byref(face_ptr)) != 0:
+                break
+            face = ctypes.cast(face_ptr, ctypes.POINTER(_FTFace))
+            family = face.contents.family_name or b""
+            if b"CJK SC" in family or (chosen is None and b"CJK" in family):
+                if chosen is not None:
+                    library.FT_Done_Face(chosen[1])
+                chosen = (library, face_ptr, face)
+                if b"CJK SC" in family:
+                    break
+            else:
+                library.FT_Done_Face(face_ptr)
+        if chosen is None:
+            return None
+        if chosen[0].FT_Set_Pixel_Sizes(chosen[1], 0, int(size)) != 0:
+            return None
+        _cjk_face = chosen
+        _cjk_size = size
+        return chosen
+    except OSError:
+        return None
+
+
+def _glyph(face_ptr, library, code: int):
+    if library.FT_Load_Char(face_ptr, code, 4) != 0:
+        return None
+    face = ctypes.cast(face_ptr, ctypes.POINTER(_FTFace))
+    slot = face.contents.glyph.contents
+    bitmap = slot.bitmap
+    if bitmap.buffer is None or bitmap.width == 0 or bitmap.rows == 0 or bitmap.pixel_mode != 2:
+        advance = max(int(slot.advance.x >> 6), 1)
+        return None, advance
+    pitch = int(bitmap.pitch)
+    rows = int(bitmap.rows)
+    width = int(bitmap.width)
+    raw = ctypes.string_at(bitmap.buffer, rows * abs(pitch))
+    pixels = np.frombuffer(raw, dtype=np.uint8).reshape(rows, abs(pitch))[:, :width].copy()
+    if pitch < 0:
+        pixels = np.flipud(pixels)
+    return pixels, int(slot.bitmap_left), int(slot.bitmap_top), max(int(slot.advance.x >> 6), width)
+
+
+def paint_notice(image: np.ndarray, text: str) -> None:
+    """在画面底部写中文提示。没有字体时保持原图。"""
+    if not text:
+        return
+    opened = _open_cjk(32)
+    if opened is None:
+        return
+    library, face_ptr, _face = opened
+    pen = 0
+    placed = []
+    for char in text:
+        glyph = _glyph(face_ptr, library, ord(char))
+        if glyph is None:
+            pen += 32
+            continue
+        if glyph[0] is None:
+            pen += int(glyph[1])
+            continue
+        pixels, left, top, advance = glyph
+        placed.append((pen + left, top, pixels))
+        pen += advance
+    if not placed:
+        return
+    tops = [top for _x, top, pixels in placed]
+    bottoms = [top - pixels.shape[0] for _x, top, pixels in placed]
+    ascent = max(tops)
+    descent = min(bottoms)
+    height = ascent - descent
+    origin_x = 16
+    origin_y = max(8, image.shape[0] - height - 16)
+
+    def blit(dx: int, dy: int, color: tuple[int, int, int]) -> None:
+        for x, top, pixels in placed:
+            y0 = origin_y + ascent - top + dy
+            x0 = origin_x + x + dx
+            y1 = min(image.shape[0], y0 + pixels.shape[0])
+            x1 = min(image.shape[1], x0 + pixels.shape[1])
+            ys = max(0, y0)
+            xs = max(0, x0)
+            if y1 <= ys or x1 <= xs:
+                continue
+            patch = pixels[ys - y0 : y1 - y0, xs - x0 : x1 - x0]
+            alpha = patch.astype(np.float32) / 255.0
+            view = image[ys:y1, xs:x1]
+            for channel, value in enumerate(color):
+                view[:, :, channel] = (alpha * value + (1.0 - alpha) * view[:, :, channel]).astype(np.uint8)
+
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        blit(dx, dy, (0, 0, 0))
+    blit(0, 0, (255, 255, 255))
 
 
 def _draw_ground(image: np.ndarray, depth: np.ndarray, intr, plane, thresh: float) -> None:
@@ -230,8 +438,8 @@ def main() -> None:
                         lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
                         lines.append(f"above top={above_top:+.3f} m")
                         lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
-                        origin_ahead, origin_right = _origin_readout(ahead, side)
-                        lines.append(f"origin ahead={origin_ahead:+.3f} m   right={origin_right:+.3f} m")
+                        world_x, world_y = _origin_readout(ahead, side)
+                        lines.append(f"world x={world_x:+.3f} m   y={world_y:+.3f} m")
             _label(vis, lines)
             chart = render_color_standard(
                 cfg["colors"],

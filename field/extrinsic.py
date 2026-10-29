@@ -1,7 +1,7 @@
 """用矩形场地的边求相机外参。
 
-世界系原点是靠近相机的那个角，X 沿长边，Y 沿短边，Z 向上。
-基础要求的相机在世界原点，水平轴由 level_extrinsic 从重力定出，不走场地边。
+场地边标定的原点是靠近相机的那个角，X 沿长边，Y 沿短边，Z 向上。
+实机世界原点是车的右前角，在地面上。水平轴由 level_extrinsic 从重力定出，不走场地边。
 提高要求只要求挪走相机后仍给出世界系位姿。安装方向和文档 2.3 的水平向前不一致时，
 继续用这里求出的外参，不换成那组固定旋转，也不改用 AprilTag。
 """
@@ -49,15 +49,33 @@ class Segment:
 # 两条边的交点是原点在相机系中的位置 t。
 # 较长的边对齐世界 X，较短的边对齐世界 Y；Z 由叉乘得到，并翻到与地面法向同侧。
 
+# 小车在地面时，彩色光心在世界系中的位置。世界原点是右前角。
+# 光心比地面标记偏右 3.5 cm、偏前 5 cm；标记再沿 X 向右 17.6 cm 是右前角。
+# 相对光心，原点在右侧 21.1 cm、后方 5 cm、下方 70 cm。
+MARK_RIGHT_OF_CAMERA_M = 0.035
+CORNER_RIGHT_OF_MARK_M = 0.176
+MARK_BEHIND_CAMERA_M = 0.05
+CAMERA_HEIGHT_M = 0.70
+OPTICAL_CENTER_IN_WORLD = np.array(
+    [
+        -(MARK_RIGHT_OF_CAMERA_M + CORNER_RIGHT_OF_MARK_M),
+        MARK_BEHIND_CAMERA_M,
+        CAMERA_HEIGHT_M,
+    ],
+    dtype=float,
+)
+
+
 def identity_extrinsic() -> tuple[np.ndarray, np.ndarray]:
-    # 光学系与世界系重合时才用。基础要求的水平世界系用 level_extrinsic。
+    # 光学系与世界系重合时才用。实机的水平世界系用 level_extrinsic。
     return np.eye(3), np.zeros(3)
 
 
-def level_extrinsic(gravity: np.ndarray, yaw: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
-    # 世界原点在光心。X 向右，Y 向前，Z 向上，都相对起步时的车头。
+def level_extrinsic(gravity: np.ndarray, yaw: float = 0.0, *, mounted: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    # X 向右，Y 向前，Z 向上，都相对起步时的车头。
     # 重力每帧重定水平。yaw 是已经执行的原地右转，加速度计看不出这个角。
-    # R 的三列是世界轴在当前光学系里的方向，平移为 0：转轴过光心。
+    # R 的三列是世界轴在当前光学系里的方向。转轴过光心，光心在世界系里保持不动。
+    # mounted 时 t 是右前角在光学系中的位置。合成图的原点在光心，调用时关掉。
     down = np.asarray(gravity, dtype=float)
     norm = float(np.linalg.norm(down))
     if norm < 1e-6:
@@ -73,7 +91,10 @@ def level_extrinsic(gravity: np.ndarray, yaw: float = 0.0) -> tuple[np.ndarray, 
     forward = np.cross(up, right)
     forward = forward / np.linalg.norm(forward)
     level = np.column_stack([right, forward, up])
-    return level @ Rz(float(yaw)), np.zeros(3)
+    rotation = level @ Rz(float(yaw))
+    if not mounted:
+        return rotation, np.zeros(3)
+    return rotation, -rotation @ OPTICAL_CENTER_IN_WORLD
 
 
 def _intersect(seg_a: Segment, seg_b: Segment) -> np.ndarray | None:

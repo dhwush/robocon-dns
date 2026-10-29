@@ -1,8 +1,9 @@
 """入口：由 D435i 的一帧估计地面方块的世界系 x、y 和 yaw。
 
-基础要求里光心是世界原点。世界轴是水平的：向右 X、向前 Y、向上 Z。
-向前锁在起步时的车头，原地转角累加进去；俯仰由重力每帧重定。
-提高要求的世界原点仍是起步时的光心，轴同样先摆成这一套，再用陀螺仪、视觉和场地边跟踪。
+世界原点是车的右前角，在地面上。世界轴是水平的：向右 X、向前 Y、向上 Z，与起步时的相机一致。
+彩色光心在这套轴里约为 x=-0.211 m、y=+0.05 m、z=+0.70 m。相机先在光心下测算，再换到这个原点。
+向前锁在起步时的车头，原地转角累加进去；俯仰由重力每帧重定，转轴过光心。
+提高要求从这一外参起步，再用陀螺仪、视觉和场地边跟踪。
 
 方块位置和 yaw 都来自地面足迹，不拟合上表面。上表面 RMS、与地面的 12° 夹角、
 6 mm 正方形残差没有对应平面，不参与丢帧。足迹的长边、短边和面积仍然丢帧。
@@ -45,6 +46,7 @@ from field.extrinsic import (
 )
 from field.motion import MotionTracker
 from fuse.median import average_scores, fuse_poses, score_trial
+from fuse.trial import TrialSession, append_trial, command_blocks_commit, open_trial_file
 from geom.transform import camera_to_world, load_intrinsics, load_intrinsics_for_serial
 from ground.plane import fit_ground, plane_holds, reuse_stable_plane, sample_points
 
@@ -275,7 +277,7 @@ def self_check(cfg: dict) -> int:
         (np.array([-0.20, 0.16, 0.7]), -0.4),
         (np.array([0.16, -0.18, 0.7]), 0.2),
     ]
-    rotation, translation = level_extrinsic(gravity)
+    rotation, translation = level_extrinsic(gravity, mounted=False)
     # 基础：三个俯视方块。光学 Y 和 yaw 与水平向前相反。同一张图重复估计再取中值。
     print("basic (level frame: x right, y forward, z up)")
     for center, yaw in targets:
@@ -518,6 +520,15 @@ def _fresh_reject(before: dict, after: dict) -> str | None:
     return found
 
 
+def _view_active(view: dict) -> bool:
+    # 给操作者看的转动指令。坐标不走这里，稳定后的 x、y、yaw 单独写入结果文件。
+    for key in ("pitch", "yaw", "seek_pitch", "seek_yaw", "footprint_pitch", "footprint_yaw"):
+        move = view.get(key) or {}
+        if isinstance(move, dict) and move.get("direction") not in (None, "none"):
+            return True
+    return False
+
+
 def _axis_delta(view: dict, key: str) -> float:
     move = view.get(key) or {}
     if move.get("direction") in (None, "none"):
@@ -574,6 +585,7 @@ def _show_test_view(
     color_lock: dict | None,
     rival_masks: list | None = None,
     frame_reject: str | None = None,
+    status: str = "",
 ) -> bool:
     # 和 view_cube_center 同一套画面：橙线是地面，绿线是颜色轮廓，青线是足迹，黄十字是体心。
     # 没有显示器时不打断取流。按下 q 或 Esc 时返回真，调用方结束循环。
@@ -587,6 +599,7 @@ def _show_test_view(
         _label,
         _origin_readout,
         _pixel,
+        paint_notice,
     )
 
     vis = color.copy()
@@ -647,8 +660,8 @@ def _show_test_view(
             lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
             lines.append(f"above top={above_top:+.3f} m")
             lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
-            origin_ahead, origin_right = _origin_readout(ahead, side)
-            lines.append(f"origin ahead={origin_ahead:+.3f} m   right={origin_right:+.3f} m")
+            world_x, world_y = _origin_readout(ahead, side)
+            lines.append(f"world x={world_x:+.3f} m   y={world_y:+.3f} m")
     if pose and "x" in pose:
         lines.append(f"world x={pose['x']:.3f}  y={pose['y']:.3f}  yaw={pose['yaw']:.3f}")
     pitch = view.get("pitch") or {}
@@ -680,6 +693,8 @@ def _show_test_view(
             cv2.cvtColor(cv2.resize(mask_view, half, interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR),
         ]
     )
+    if status:
+        paint_notice(preview[:, : half[0]], status)
     try:
         cv2.imshow("cube center", preview)
         key = cv2.waitKey(1) & 0xFF
@@ -691,12 +706,16 @@ def _show_test_view(
 # --- 实机循环 -----------------------------------------------------------------
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
 # field 模式从起步相机跟踪：场地边能看见就校正，看不见就用视觉，视觉也失败再靠陀螺仪，超过 track_hold_s 停止输出。
-# 合格样本满 min_samples 帧才输出位姿。已经识别出来时，只有方块被画面边切掉才给出俯仰和原地转角。
+# 合格样本满 min_samples 帧才在画面上给出估计。正式的 x、y、yaw 另计：
+# 本次观察满 min_trial_s，并且连续 stable_frames 帧的位置和 yaw 都稳定，才写入结果文件。
+# 单条达到 10° 的转动指令、丢帧，或相邻帧地面中心跳过 3 cm，都会清空这一窗。15 秒不因此重计。
+# 写出后画面显示换位置。方块离开 trial_move_m 并持续 trial_move_frames 帧，或丢失超过 1 秒后再出现，下一次才计时。
+# 写满 trial_count 后不再追加。已经识别出来时，只有方块被画面边切掉才给出俯仰和原地转角。
 # 连续 seek_miss_frames 帧没有位姿，才微调。转角每拍最多 2.5°，俯仰只要还要转就是 5°。
 # 地面还在、绿线连续停在一处、足迹失败时，改输出 footprint_pitch、footprint_yaw。
 # 相机没转时，地面拟合失败或原点跳变的几帧沿用上一块合格平面。一开始俯仰或原地转就丢掉它。
 # 地面或外参平移跳过 30 mm 时清空缓冲。
-# 失败后 0.5 s 内重复上一结果，再失败则输出空对象。丢帧原因累加后写到标准错误。
+# 失败后 0.5 s 内重复上一结果，再失败则画面上不再沿用。丢帧原因累加后写到标准错误。
 
 def _field_pose(color, intr, cfg, plane):
     # 边不在画面里就返回空，调用方改走陀螺仪和视觉跟踪，不把这一帧判成标定失败。
@@ -732,7 +751,7 @@ def run_live(
     serial: str | None = None,
     color_lock: dict | None = None,
 ) -> None:
-    # 实机循环。标定分支写完文件就返回；正常分支凑满样本后按 output_hz 打印 JSON。
+    # 实机循环。标定分支写完文件就返回。识别分支把稳定后的 x、y、yaw 写入结果文件。
     source = RealSenseSource(
         intr.width,
         intr.height,
@@ -786,6 +805,11 @@ def run_live(
     light_name = str((color_lock or {}).get("name") or cfg.get("light") or "daylight")
     vis_last = time.monotonic()
     vis_fps = 0.0
+    session = TrialSession.from_config(cfg)
+    result_file = None
+    if not calibrate and not calibrate_color:
+        result_file = open_trial_file(cfg.get("result_path", "results/cube_trials.txt"))
+        session.begin(time.monotonic())
     try:
         while True:
             frame = source.read()
@@ -905,6 +929,7 @@ def run_live(
                 stable_plane = None
                 stable_left = 0
                 picker.reset()
+                session.drop_window()
             rival_masks = [world.pop("mask", None) for world in worlds]
             sample = picker.choose(worlds)
             # 绿线暂时跳到杂物上时，不把那一帧写进中值，输出仍用上一块稳定方块。
@@ -1042,23 +1067,26 @@ def run_live(
                 # 下一帧画面已经跟着转，不能再把点投到转之前的地面上。
                 stable_plane = None
                 stable_left = 0
-            clipped = any((view.get("clipped") or {}).values())
-            if now - last_print >= output_period:
-                # 位姿要等样本凑满。连续失败没到门限时不附 seek_。
-                # 已经识别出来时，只有被画面边切到才附上原来的 pitch、yaw。
-                has_pose = isinstance(payload, dict) and "x" in payload
-                if not pose_ok:
-                    printed = with_view(payload if has_pose else {}, view)
-                    print(json.dumps(printed))
-                    last_print = now
-                elif clipped or has_pose:
-                    printed = with_view(payload, view) if clipped else dict(payload)
-                    print(json.dumps(printed))
-                    last_print = now
+            record = session.update(sample, now, command_blocks_commit(view, session.motion_deg))
+            if record is not None:
+                text = record.text() if result_file is None else append_trial(result_file, record)
+                print(text, end="", flush=True)
+            if now - last_print >= output_period and _view_active(view):
+                # 转动指令仍然打出来。x、y、yaw 只在上面那一次写入，不按 output_hz 重复。
+                print(json.dumps(with_view({}, view)))
+                last_print = now
             tick = time.monotonic()
             vis_fps = 1.0 / max(tick - vis_last, 1e-3)
             vis_last = tick
-            pose_text = payload if isinstance(payload, dict) and "x" in payload else None
+            pose_text = session.preview()
+            if (
+                pose_text is None
+                and session.phase == "collect"
+                and sample is not None
+                and isinstance(payload, dict)
+                and "x" in payload
+            ):
+                pose_text = payload
             if _show_test_view(
                 frame.color,
                 depth,
@@ -1072,12 +1100,15 @@ def run_live(
                 color_lock,
                 rival_masks,
                 frame_reject,
+                session.status,
             ):
                 return
             if rejects != logged_rejects:
                 print(json.dumps({"reject_counts": rejects}), file=sys.stderr)
                 logged_rejects = dict(rejects)
     finally:
+        if result_file is not None:
+            result_file.close()
         source.close()
         try:
             import cv2

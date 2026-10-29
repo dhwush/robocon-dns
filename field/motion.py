@@ -1,6 +1,6 @@
 """从相机起步位置连续跟踪，并用场地边校正漂移。
 
-世界原点是第一帧的相机光心，轴与当时的相机轴重合。之后每帧：
+调用方在 start 之后写入起步外参。实机用 level_extrinsic，世界原点是右前角。之后每帧：
 
 - 陀螺仪只在视觉跟踪失败时维持朝向，平移先保持不动。
 - 深度视觉里程计成功时，用它更新从上一帧到这一帧的旋转和平移。
@@ -138,7 +138,7 @@ class MotionTracker:
         self.initial_up = vector / norm
 
     def start(self, color_bgr: np.ndarray, depth: np.ndarray, up_camera: np.ndarray | None = None) -> None:
-        # 第一帧光心是世界原点。调用方若要水平世界轴，在 start 之后写入 level_extrinsic。
+        # 先记成光心与单位旋转。调用方紧接着写入 level_extrinsic，原点改到右前角。
         # 这一帧之前的陀螺样品丢掉，避免把上电时刻算进位移。
         self.rotation = np.eye(3)
         self.translation = np.zeros(3)
