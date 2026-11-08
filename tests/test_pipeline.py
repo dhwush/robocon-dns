@@ -8,6 +8,7 @@ from cube.face_fallback import fit_when_face_missing
 from field.extrinsic import (
     OPTICAL_CENTER_IN_WORLD,
     Segment,
+    camera_corner_extrinsic,
     estimate_from_lines,
     level_extrinsic,
     load_extrinsic,
@@ -371,6 +372,20 @@ def test_ray_when_ground_holds_depth_when_plane_is_high():
         size_tolerance=float(cfg["size_tolerance"]),
     )
     assert pose_depth is None
+
+
+def test_camera_corner_extrinsic_stays_on_the_current_camera():
+    """原点在相机右侧 0.211 m、后方 0.05 m、朝下 0.70 m。轴跟着相机，不看重力。"""
+    rotation, translation = camera_corner_extrinsic()
+    np.testing.assert_allclose(rotation[:, 0], [1.0, 0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(rotation[:, 1], [0.0, 0.0, 1.0], atol=1e-12)
+    np.testing.assert_allclose(rotation[:, 2], [0.0, -1.0, 0.0], atol=1e-12)
+    optical = camera_to_world(np.zeros(3), rotation, translation)
+    np.testing.assert_allclose(optical, OPTICAL_CENTER_IN_WORLD, atol=1e-12)
+    origin = camera_to_world(translation, rotation, translation)
+    np.testing.assert_allclose(origin, 0.0, atol=1e-12)
+    ahead = camera_to_world(np.array([0.0, 0.0, 1.0]), rotation, translation)
+    np.testing.assert_allclose(ahead, optical + np.array([0.0, 1.0, 0.0]), atol=1e-12)
 
 
 def test_level_extrinsic_puts_optical_center_on_the_front_corner():

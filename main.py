@@ -1,9 +1,8 @@
-"""入口：由 D435i 的一帧估计地面方块的世界系 x、y 和 yaw。
+"""入口：由 D435i 的一帧估计地面方块在当前相机坐标系下的 x、y 和 yaw。
 
-世界原点是车的右前角，在地面上。世界轴是水平的：向右 X、向前 Y、向上 Z，与起步时的相机一致。
-彩色光心在这套轴里约为 x=-0.211 m、y=+0.05 m、z=+0.70 m。相机先在光心下测算，再换到这个原点。
-向前锁在起步时的车头，原地转角累加进去；俯仰由重力每帧重定，转轴过光心。
-提高要求从这一外参起步，再用陀螺仪、视觉和场地边跟踪。
+原点是当前相机姿态下的右前点：沿相机向右 0.211 m、向后 0.05 m、沿相机朝下 0.70 m。
+X 为相机右方，Y 为相机前方，Z 为相机上方。车转动、俯仰或被推走时，原点跟着相机走。
+已转过的角度不累加，也不把位姿拉回起步点。
 
 方块位置和 yaw 都来自地面足迹，不拟合上表面。上表面 RMS、与地面的 12° 夹角、
 6 mm 正方形残差没有对应平面，不参与丢帧。足迹的长边、短边和面积仍然丢帧。
@@ -40,14 +39,13 @@ from cube.detect import (
 from cube.rival import RivalPicker
 from field.extrinsic import (
     calibrate_from_image,
-    identity_extrinsic,
+    camera_corner_extrinsic,
     level_extrinsic,
     save_extrinsic,
 )
-from field.motion import MotionTracker
 from fuse.median import average_scores, fuse_poses, score_trial
 from fuse.trial import TrialSession, append_trial, command_blocks_commit, open_trial_file
-from geom.transform import camera_to_world, load_intrinsics, load_intrinsics_for_serial
+from geom.transform import camera_to_world, fold_yaw_quarter, load_intrinsics, load_intrinsics_for_serial
 from ground.plane import fit_ground, plane_holds, reuse_stable_plane, sample_points
 
 # --- 单帧估计 -----------------------------------------------------------------
@@ -82,11 +80,11 @@ def _ground_up_ok(plane, rotation: np.ndarray, initial_up: np.ndarray | None = N
 
 
 def pose_to_world(pose, rotation: np.ndarray, translation: np.ndarray, plane, height: float) -> dict:
-    # 足迹中心在地面上，x、y 就是几何中心的水平位置。沿地面法向抬 h/2 得到几何中心。
+    # 足迹中心在地面上。沿地面法向抬 h/2 得到几何中心，再变到当前相机的右前点坐标系。
     # 没有上表面，不能按顶面公式再减一次半高。
     center = pose.bottom_center + plane.normal * (0.5 * height)
     world = camera_to_world(center, rotation, translation)
-    # 平面在世界系里的垂足。相机绕光心转或平移时，同一块地面的这个点不动。
+    # 平面在当前相机坐标系里的垂足。相机相对地面一动，这个点就变，用来清空融合缓冲。
     normal_c = np.asarray(plane.normal, dtype=float)
     normal_w = rotation.T @ normal_c
     offset_w = float(plane.offset) - float(normal_c @ np.asarray(translation, dtype=float))
@@ -201,8 +199,11 @@ def estimate_candidates(
     rejects: dict | None = None,
     initial_up: np.ndarray | None = None,
     plane=_UNSET,
+    *,
+    check_up: bool = True,
 ) -> list[dict]:
     # 一帧最多 3 个通过足迹的物体。谁是方块由多帧的地面中心比较决定。
+    # 实机轴跟着相机，低头时地面法向不再对齐输出 Z，check_up 关掉。
     depth = frame.depth
     if plane is _UNSET:
         gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 0.0, 1.0])
@@ -210,7 +211,7 @@ def estimate_candidates(
     if plane is None:
         _bump(rejects, "ground")
         return []
-    if not _ground_up_ok(plane, rotation, initial_up):
+    if check_up and not _ground_up_ok(plane, rotation, initial_up):
         _bump(rejects, "world_up")
         return []
     local_rejects: dict[str, int] = {}
@@ -597,7 +598,6 @@ def _show_test_view(
         _draw_ground,
         _ground_readout,
         _label,
-        _origin_readout,
         _pixel,
         paint_notice,
     )
@@ -656,12 +656,17 @@ def _show_test_view(
         if readout is None:
             lines.append("camera looks straight down")
         else:
-            ahead, side, above_top, yaw = readout
+            ahead, side, above_top, _ground_yaw = readout
             lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
             lines.append(f"above top={above_top:+.3f} m")
-            lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
-            world_x, world_y = _origin_readout(ahead, side)
-            lines.append(f"world x={world_x:+.3f} m   y={world_y:+.3f} m")
+        mount_r, mount_t = camera_corner_extrinsic()
+        world = camera_to_world(body, mount_r, mount_t)
+        edge_w = mount_r.T @ edge
+        yaw = fold_yaw_quarter(float(np.arctan2(edge_w[1], edge_w[0])))
+        lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
+        lines.append(
+            f"world x={float(world[0]):+.3f} m   y={float(world[1]):+.3f} m   z={float(world[2]):+.3f} m"
+        )
     if pose and "x" in pose:
         lines.append(f"world x={pose['x']:.3f}  y={pose['y']:.3f}  yaw={pose['yaw']:.3f}")
     pitch = view.get("pitch") or {}
@@ -705,7 +710,7 @@ def _show_test_view(
 
 # --- 实机循环 -----------------------------------------------------------------
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
-# field 模式从起步相机跟踪：场地边能看见就校正，看不见就用视觉，视觉也失败再靠陀螺仪，超过 track_hold_s 停止输出。
+# 输出坐标固定在当前相机上，原点是右前点。不按重力摆平，也不跟踪起步位置。
 # 合格样本满 min_samples 帧才在画面上给出估计。正式的 x、y、yaw 另计：
 # 本次观察满 min_trial_s，并且连续 stable_frames 帧的位置和 yaw 都稳定，才写入结果文件。
 # 单条达到 10° 的转动指令、丢帧，或相邻帧地面中心跳过 3 cm，都会清空这一窗。15 秒不因此重计。
@@ -716,14 +721,6 @@ def _show_test_view(
 # 相机没转时，地面拟合失败或原点跳变的几帧沿用上一块合格平面。一开始俯仰或原地转就丢掉它。
 # 地面或外参平移跳过 30 mm 时清空缓冲。
 # 失败后 0.5 s 内重复上一结果，再失败则画面上不再沿用。丢帧原因累加后写到标准错误。
-
-def _field_pose(color, intr, cfg, plane):
-    # 边不在画面里就返回空，调用方改走陀螺仪和视觉跟踪，不把这一帧判成标定失败。
-    # 地面和方块检测共用这一帧已经拟合好的平面。
-    if plane is None:
-        return None
-    return calibrate_from_image(color, intr, plane, cfg["field_length"], cfg["field_width"])
-
 
 def live_intrinsics(serial: str | None = None):
     # 没接相机时不猜一台。接了一台就用它的序列号。接了多台必须指明号码。
@@ -752,6 +749,8 @@ def run_live(
     color_lock: dict | None = None,
 ) -> None:
     # 实机循环。标定分支写完文件就返回。识别分支把稳定后的 x、y、yaw 写入结果文件。
+    # basic 和 field 都用当前相机的右前点，mode 不再切换跟踪。
+    _ = mode
     source = RealSenseSource(
         intr.width,
         intr.height,
@@ -759,16 +758,7 @@ def run_live(
         serial=serial,
         color_lock=color_lock,
     )
-    rotation, translation = identity_extrinsic()
-    # 基础模式已经执行的原地右转。识别成功不清零，俯仰不累加，改由重力重定。
-    executed_yaw = 0.0
-    tracker = None
-    if mode == "field" and not calibrate:
-        tracker = MotionTracker(
-            hold_s=float(cfg.get("track_hold_s", 0.3)),
-            vo_thresh_m=float(cfg.get("track_vo_thresh_m", 0.02)),
-            min_points=int(cfg.get("track_min_points", 12)),
-        )
+    rotation, translation = camera_corner_extrinsic()
     samples: list[dict] = []
     # 绿线在最多 3 个物体之间跳时，地面中心超过 15 cm 不送进中值。
     picker = RivalPicker(cube_size=float(cfg["cube_size"]))
@@ -780,7 +770,6 @@ def run_live(
     last_translation = None
     rejects: dict[str, int] = {}
     logged_rejects = {}
-    last_tick: float | None = None
     hold_s = float(cfg.get("hold_s", 0.5))
     jump_m = float(cfg.get("jump_m", 0.03))
     min_samples = int(cfg.get("min_samples", 5))
@@ -854,15 +843,9 @@ def run_live(
                 return
             frame = Frame(frame.color, depth, frame.gravity, frame.gyro)
             now = time.monotonic()
-            dt = 0.0 if last_tick is None else now - last_tick
-            last_tick = now
-            initial_up = None
-            if tracker is not None:
-                gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
-            else:
-                # 没有加速度计时按光轴水平：图像向下是重力。俯仰一旦有重力就以它为准。
-                gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
-                rotation, translation = level_extrinsic(gravity, executed_yaw)
+            # 地面仍用重力拟合。输出轴不跟重力走，固定在当前相机上。
+            gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
+            rotation, translation = camera_corner_extrinsic()
             plane_fresh = _acquire_plane(depth, intr, cfg, gravity, None if turning else stable_plane)
             plane, stable_plane, stable_left = reuse_stable_plane(
                 plane_fresh,
@@ -874,40 +857,17 @@ def run_live(
             )
             turning = False
             reject_before = dict(rejects)
-            if tracker is not None:
-                up = None if frame.gravity is None else -frame.gravity
-                if not tracker.started:
-                    tracker.start(frame.color, depth, up)
-                    if up is not None:
-                        # 起步轴改成向右、向前、向上。之后的陀螺和视觉都相对这套轴积分。
-                        tracker.rotation, tracker.translation = level_extrinsic(-up)
-                else:
-                    tracker.begin_frame()
-                    tracker.integrate_gyro(frame.gyro or [])
-                    visual = tracker.observe_visual(frame.color, depth, intr)
-                    field_pose = _field_pose(frame.color, intr, cfg, plane)
-                    if field_pose is not None:
-                        tracker.observe_field(*field_pose)
-                        tracker.note_locked()
-                    elif visual == "ok":
-                        tracker.note_locked()
-                    else:
-                        tracker.note_lost(dt)
-                if tracker.initial_up is None and up is not None:
-                    tracker.set_initial_up(up)
-                rotation, translation = tracker.pose()
-                initial_up = tracker.initial_up
-                if not tracker.reliable:
-                    _bump(rejects, "track")
-                    worlds = []
-                else:
-                    worlds = estimate_candidates(
-                        frame, intr, cfg, rotation, translation, rejects, initial_up, plane
-                    )
-            else:
-                worlds = estimate_candidates(
-                    frame, intr, cfg, rotation, translation, rejects, initial_up, plane
-                )
+            worlds = estimate_candidates(
+                frame,
+                intr,
+                cfg,
+                rotation,
+                translation,
+                rejects,
+                None,
+                plane,
+                check_up=False,
+            )
             frame_reject = None if worlds else _fresh_reject(reject_before, rejects)
             origin = None
             if worlds:
@@ -934,8 +894,6 @@ def run_live(
             sample = picker.choose(worlds)
             # 绿线暂时跳到杂物上时，不把那一帧写进中值，输出仍用上一块稳定方块。
             replay = last_record if sample is None and picker.holding and last_record is not None else None
-            if sample is not None and tracker is not None and tracker.reliable:
-                sample["track"] = tracker.source
             chosen_mask = None
             if sample is not None:
                 for world, mask in zip(worlds, rival_masks):
@@ -1053,16 +1011,14 @@ def run_live(
             if yaw_delta != 0.0:
                 seek_yaw_sum += yaw_delta
                 turning = True
-            if tracker is None:
-                # 贴边时的整段转角、seek_ 和 footprint_ 都会让车转。限额仍只用后面两项。
-                full_yaw = (
-                    _axis_delta(view, "yaw")
-                    + _axis_delta(view, "seek_yaw")
-                    + _axis_delta(view, "footprint_yaw")
-                )
-                if full_yaw != 0.0:
-                    executed_yaw += full_yaw
-                    turning = True
+            # 贴边时的整段转角也会让车转。转过之后画面变了，地面不能沿用。角度不写进坐标。
+            full_yaw = (
+                _axis_delta(view, "yaw")
+                + _axis_delta(view, "seek_yaw")
+                + _axis_delta(view, "footprint_yaw")
+            )
+            if full_yaw != 0.0:
+                turning = True
             if turning:
                 # 下一帧画面已经跟着转，不能再把点投到转之前的地面上。
                 stable_plane = None

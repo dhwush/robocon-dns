@@ -2,7 +2,7 @@
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
 橙色线是拟合地面上最大的一块，内点放宽到 18 mm。画面写出地面上的前方距离、左右距离和地面 yaw。
-另一行把地面上的前方、右方换到世界坐标。原点是右前角，光心在 x=-0.211 m、y=+0.05 m。按 q 或 Esc 退出。
+另一行是当前相机右前点坐标系里的体心。轴跟着相机：向右 X、向前 Y、向上 Z。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
@@ -25,8 +25,8 @@ from cube.detect import (
     render_color_standard,
     show_color_standard,
 )
-from field.extrinsic import OPTICAL_CENTER_IN_WORLD
-from geom.transform import deproject_pixels, fold_yaw_quarter, project_points
+from field.extrinsic import camera_corner_extrinsic
+from geom.transform import camera_to_world, deproject_pixels, fold_yaw_quarter, project_points
 from ground.plane import fit_ground, plane_holds, sample_points
 from main import live_intrinsics, load_config
 
@@ -58,12 +58,6 @@ def _ground_readout(bottom: np.ndarray, plane, edge: np.ndarray, cube_size: floa
     else:
         yaw = fold_yaw_quarter(float(np.arctan2(flat_edge @ forward, flat_edge @ right)))
     return ahead, side, above_top, yaw
-
-
-def _origin_readout(ahead: float, right: float) -> tuple[float, float]:
-    # ahead、right 相对光心在地面上的正下方。世界原点是右前角，轴与起步时的相机一致。
-    center = OPTICAL_CENTER_IN_WORLD
-    return float(right) + float(center[0]), float(ahead) + float(center[1])
 
 
 def _pixel(point: np.ndarray, intr) -> tuple[int, int] | None:
@@ -434,12 +428,17 @@ def main() -> None:
                     if readout is None:
                         lines.append("camera looks straight down")
                     else:
-                        ahead, side, above_top, yaw = readout
+                        ahead, side, above_top, _ground_yaw = readout
                         lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
                         lines.append(f"above top={above_top:+.3f} m")
-                        lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
-                        world_x, world_y = _origin_readout(ahead, side)
-                        lines.append(f"world x={world_x:+.3f} m   y={world_y:+.3f} m")
+                    mount_r, mount_t = camera_corner_extrinsic()
+                    world = camera_to_world(body, mount_r, mount_t)
+                    edge_w = mount_r.T @ np.asarray(pose.edge_direction, dtype=float)
+                    yaw = fold_yaw_quarter(float(np.arctan2(edge_w[1], edge_w[0])))
+                    lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
+                    lines.append(
+                        f"world x={float(world[0]):+.3f} m   y={float(world[1]):+.3f} m   z={float(world[2]):+.3f} m"
+                    )
             _label(vis, lines)
             chart = render_color_standard(
                 cfg["colors"],

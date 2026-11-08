@@ -1,7 +1,7 @@
 """用矩形场地的边求相机外参。
 
 场地边标定的原点是靠近相机的那个角，X 沿长边，Y 沿短边，Z 向上。
-实机世界原点是车的右前角，在地面上。水平轴由 level_extrinsic 从重力定出，不走场地边。
+实机输出用 camera_corner_extrinsic：原点是当前相机姿态下的右前点，轴跟着相机，不靠重力摆平。
 提高要求只要求挪走相机后仍给出世界系位姿。安装方向和文档 2.3 的水平向前不一致时，
 继续用这里求出的外参，不换成那组固定旋转，也不改用 AprilTag。
 """
@@ -67,8 +67,19 @@ OPTICAL_CENTER_IN_WORLD = np.array(
 
 
 def identity_extrinsic() -> tuple[np.ndarray, np.ndarray]:
-    # 光学系与世界系重合时才用。实机的水平世界系用 level_extrinsic。
+    # 光学系与世界系重合时才用。实机输出用 camera_corner_extrinsic。
     return np.eye(3), np.zeros(3)
+
+
+def camera_corner_extrinsic() -> tuple[np.ndarray, np.ndarray]:
+    # 轴固定在当前相机上，不看重力，也不扣已经转过的角。
+    # 光学系是 X 右、Y 下、Z 前。输出 X 向右、Y 向前、Z 向上。
+    # 原点在光心右侧 0.211 m、后方 0.05 m、沿相机朝下 0.70 m。车一动，这个点跟着走。
+    right = np.array([1.0, 0.0, 0.0])
+    forward = np.array([0.0, 0.0, 1.0])
+    up = np.array([0.0, -1.0, 0.0])
+    rotation = np.column_stack([right, forward, up])
+    return rotation, -rotation @ OPTICAL_CENTER_IN_WORLD
 
 
 def level_extrinsic(gravity: np.ndarray, yaw: float = 0.0, *, mounted: bool = True) -> tuple[np.ndarray, np.ndarray]:
