@@ -1,0 +1,27 @@
+# Python 字节码和缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# Office / LibreOffice 临时锁文件
+.~*
+~$*
+
+# 注意：results/cube_trials.txt 保持跟踪。
+# fuse/trial.py 的 open_trial_file 每次启动用 "w" 模式清空它，但里面是真实的三次
+# 实测数据（x/y/yaw），团队历史上一直跟踪它，git log 里能看到每次调参对应的测量值。
+# 所以这里不忽略 results/，避免出现"规则说忽略、实际还在跟踪"的矛盾状态。
+# 如果以后想改成不跟踪，执行：
+#   git rm --cached results/cube_trials.txt
