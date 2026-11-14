@@ -747,6 +747,7 @@ def run_live(
     debug: bool,
     serial: str | None = None,
     color_lock: dict | None = None,
+    headless: bool = False,
 ) -> None:
     # 实机循环。标定分支写完文件就返回。识别分支把稳定后的 x、y、yaw 写入结果文件。
     # basic 和 field 都用当前相机的右前点，mode 不再切换跟踪。
@@ -803,13 +804,14 @@ def run_live(
         while True:
             frame = source.read()
             depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
-            chart = render_color_standard(
-                cfg["colors"],
-                light_name,
-                cfg.get("light_levels"),
-                measure_scene_hsv(frame.color, cfg["colors"]),
-            )
-            show_color_standard(chart, pump=False)
+            if not headless:
+                chart = render_color_standard(
+                    cfg["colors"],
+                    light_name,
+                    cfg.get("light_levels"),
+                    measure_scene_hsv(frame.color, cfg["colors"]),
+                )
+                show_color_standard(chart, pump=False)
             if calibrate_color:
                 color_frames.append((frame.color.copy(), depth))
                 if len(color_frames) < int(cfg.get("hsv_calib_frames", 30)):
@@ -1043,7 +1045,7 @@ def run_live(
                 and "x" in payload
             ):
                 pose_text = payload
-            if _show_test_view(
+            if not headless and _show_test_view(
                 frame.color,
                 depth,
                 cfg,
@@ -1062,6 +1064,8 @@ def run_live(
             if rejects != logged_rejects:
                 print(json.dumps({"reject_counts": rejects}), file=sys.stderr)
                 logged_rejects = dict(rejects)
+    except KeyboardInterrupt:
+        pass
     finally:
         if result_file is not None:
             result_file.close()
@@ -1069,7 +1073,8 @@ def run_live(
         try:
             import cv2
 
-            cv2.destroyAllWindows()
+            if not headless:
+                cv2.destroyAllWindows()
         except cv2.error:
             pass
 
@@ -1085,6 +1090,7 @@ def main() -> None:
     parser.add_argument("--calibrate-color", action="store_true")
     parser.add_argument("--light", default=None, help="亮度档：bright、daylight、indoor、dim、dark")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--headless", action="store_true", help="SSH无窗口识别，终端输出结果，Ctrl+C退出")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -1105,6 +1111,7 @@ def main() -> None:
         args.debug,
         serial=serial,
         color_lock=color_lock,
+        headless=args.headless,
     )
 
 
