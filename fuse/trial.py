@@ -20,6 +20,8 @@ FINISHED = "识别完成"
 
 def command_blocks_commit(view: dict, limit_deg: float = 10.0) -> bool:
     """单条达到 limit_deg 的俯仰或原地转角会让这一窗不能提交。小于该角度的指令不挡。"""
+    if "motion_active" in view:
+        return bool(view["motion_active"])
     for key in _MOVE_KEYS:
         move = view.get(key) or {}
         if not isinstance(move, dict) or move.get("direction") in (None, "none"):

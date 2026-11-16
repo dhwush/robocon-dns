@@ -4,7 +4,7 @@
 right 是向右转，left 是向左转。两个角度都是还要再转的大小，单位弧度，方向另给。
 
 已经识别出来时，只有红蓝掩膜贴到画面边才给出 pitch、yaw。完整留在画面里不再建议转动。
-连续几帧没有识别出来之后，才用 seek_pitch、seek_yaw 做微调。转角每拍最多 2.5°。
+连续几帧没有识别出来之后，才用 seek_pitch、seek_yaw 做微调。转角每拍最多 5°。
 俯仰低于大约 5° 机构执行不了，所以只要还要俯仰，这一拍就是 5°，不再给出更小的一步。
 红蓝块不在光轴上时，方向仍是把它收到光轴上。
 已经对准、没有红蓝，或连续几帧都是地面失败时，只微调俯仰，seek_yaw 保持 none。
@@ -29,11 +29,11 @@ from cube.detect import _color_layers
 from geom.transform import Intrinsics, deproject_pixels
 
 
-_DEADBAND_RAD = np.deg2rad(0.6)
+_DEADBAND_RAD = np.deg2rad(3.0)
 # 顶面正方形对角线。补到这个跨度，四个上角才有机会一起进画面。
 _DIAGONAL = float(np.sqrt(2.0))
 # 未识别时原地转角每拍最多这么多。再大容易把已经差不多能看见的方块转出画面。
-_SEEK_YAW_STEP_RAD = np.deg2rad(2.5)
+_SEEK_YAW_STEP_RAD = np.deg2rad(5.0)
 # 俯仰机构低于大约 5° 不动。只要这一拍还要俯仰，就给整整 5°。
 _SEEK_PITCH_STEP_RAD = np.deg2rad(5.0)
 # 光轴已经比这个更朝下时，地面失败不再继续下俯。其他未识别改为上仰一拍。
@@ -111,7 +111,7 @@ class ViewAdjustment:
 
 def _move(kind: str, signed: float) -> AxisMove:
     # 小于死区就当成已经对准，避免在 0 附近来回给相反方向。
-    if abs(signed) < _DEADBAND_RAD:
+    if abs(signed) <= _DEADBAND_RAD + 1e-12:
         return _none_move()
     if kind == "pitch":
         direction = "down" if signed > 0.0 else "up"
@@ -248,7 +248,7 @@ def _seek_pitch_when_centered(gravity: np.ndarray | None, *, stop_when_low: bool
 
 def _pitch_step(signed: float, room: float | None) -> AxisMove:
     # 剩余额度不够 5° 时这一拍不俯仰。给出 3° 机构也不会动。
-    if abs(signed) < _DEADBAND_RAD:
+    if abs(signed) <= _DEADBAND_RAD + 1e-12:
         return _none_move()
     if room is not None and float(room) + 1e-6 < _SEEK_PITCH_STEP_RAD:
         return _none_move()
@@ -256,7 +256,7 @@ def _pitch_step(signed: float, room: float | None) -> AxisMove:
 
 
 def _micro(kind: str, signed: float, room: float | None) -> AxisMove:
-    # 俯仰固定 5°。转角每拍重新按当前画面计算，再限制到 2.5°。room 是这一轴还允许累计的弧度。
+    # 俯仰固定 5°。转角每拍重新按当前画面计算，再限制到 5°。room 是这一轴还允许累计的弧度。
     if kind == "pitch":
         return _pitch_step(signed, room)
     if room is not None and room <= _DEADBAND_RAD:
@@ -443,11 +443,12 @@ def plan_view(
     pitch_room: float | None = None,
     yaw_room: float | None = None,
     yaw_bias: float = 1.0,
+    target_mask: np.ndarray | None = None,
 ) -> ViewAdjustment:
     """根据当前画面给出俯仰和原地转角。
 
     recognized 为真、seek 为假时，没有红蓝块，或方块没有被画面边切到，都不建议转动。
-    seek 为真时，调用方已经数过连续失败帧。转角每拍最多 2.5°，俯仰只要还要转就是 5°。
+    seek 为真时，调用方已经数过连续失败帧。转角每拍最多 5°，俯仰只要还要转就是 5°。
     连续失败还没到门限时，recognized 和 seek 都为假，这一帧不转。
     ground_lost 为真时不跟着颜色块转，只尝试下俯，让画面里多露出地面。
     footprint_lost 为真时地面还在，绿线也连续停在一处，只是足迹失败。
@@ -456,7 +457,15 @@ def plan_view(
     if seek is None:
         seek = not recognized
     strict, _loose, _front = _color_layers(color_bgr, colors)
-    mask = _largest_mask(strict, min_pixels)
+    if target_mask is not None:
+        target_mask = np.asarray(target_mask)
+        if target_mask.shape != color_bgr.shape[:2]:
+            raise ValueError("瞄准掩膜必须与当前图像同尺寸")
+        mask = np.where(target_mask > 0, np.uint8(255), np.uint8(0))
+        if not np.any(mask):
+            mask = None
+    else:
+        mask = _largest_mask(strict, min_pixels)
     _right, _forward, _up, assumed = _level_axes(gravity)
     blank = {"left": False, "right": False, "top": False, "bottom": False}
     if footprint_lost and mask is not None and not ground_lost:
@@ -541,6 +550,8 @@ def run_live(cfg: dict, intr: Intrinsics, serial: str | None, color_lock: dict |
 
     from camera.source import Frame, RealSenseSource, filter_depth
 
+    from angle_feedback import RelativeStop
+    feedback = RelativeStop()
     source = RealSenseSource(
         intr.width,
         intr.height,
@@ -564,9 +575,10 @@ def run_live(cfg: dict, intr: Intrinsics, serial: str | None, color_lock: dict |
                 zmin=float(cfg["depth_min"]),
                 zmax=float(cfg["depth_max"]),
             )
+            command = feedback.apply(adjustment.as_dict(), frame.gravity, frame.gyro)
             now = time.monotonic()
             if now - last >= period:
-                print(json.dumps(adjustment.as_dict(), ensure_ascii=False))
+                print(json.dumps(command, ensure_ascii=False))
                 last = now
     finally:
         source.close()

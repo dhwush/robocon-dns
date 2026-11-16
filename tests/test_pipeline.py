@@ -374,8 +374,8 @@ def test_ray_when_ground_holds_depth_when_plane_is_high():
     assert pose_depth is None
 
 
-def test_camera_corner_extrinsic_stays_on_the_current_camera():
-    """原点在相机右侧 0.211 m、后方 0.05 m、朝下 0.70 m。轴跟着相机，不看重力。"""
+def test_camera_corner_extrinsic_horizontal_mount():
+    """水平安装时光心位置为车身右前点左侧0.211 m、前方0.05 m、上方0.675 m。"""
     rotation, translation = camera_corner_extrinsic()
     np.testing.assert_allclose(rotation[:, 0], [1.0, 0.0, 0.0], atol=1e-12)
     np.testing.assert_allclose(rotation[:, 1], [0.0, 0.0, 1.0], atol=1e-12)
@@ -394,7 +394,7 @@ def test_level_extrinsic_puts_optical_center_on_the_front_corner():
     rotation, translation = level_extrinsic(gravity, yaw=0.4)
     optical = camera_to_world(np.zeros(3), rotation, translation)
     np.testing.assert_allclose(optical, OPTICAL_CENTER_IN_WORLD, atol=1e-9)
-    np.testing.assert_allclose(OPTICAL_CENTER_IN_WORLD, [-0.211, 0.05, 0.70], atol=1e-12)
+    np.testing.assert_allclose(OPTICAL_CENTER_IN_WORLD, [-0.211, 0.05, 0.675], atol=1e-12)
     origin = camera_to_world(translation, rotation, translation)
     np.testing.assert_allclose(origin, 0.0, atol=1e-9)
     bare_rotation, bare_translation = level_extrinsic(gravity, yaw=0.4, mounted=False)

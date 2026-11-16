@@ -67,3 +67,8 @@ colors:
     hsv_low: [100, 80, 60]
     hsv_high: [130, 255, 255]
     front: false
+
+# 当前小车右前点坐标，X右/Y前/Z上。相机水平时的实测光心位置，单位米。
+camera_optical_center_m: [-0.211, 0.05, 0.675]
+# 相机水平时“俯仰转轴→光心”的右/前/上偏移。尚未测量，暂按光心转动。
+camera_pivot_to_optical_m: [0.0, 0.0, 0.0]

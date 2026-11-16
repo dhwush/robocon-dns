@@ -273,10 +273,10 @@ class RealSenseSource:
                     if self._accel is not None:
                         gravity = self._accel.copy()
             with self._lock:
-                gyro = list(self._gyro)
-                self._gyro.clear()
-                self._pending = (color, depth, gravity, gyro)
-            self._event.set()
+                # 回调可覆盖旧图像，但陀螺仪必须等消费者read后再清。
+                # 2–3FPS处理时仍保留两次read之间所有惯性样本。
+                self._pending = (color, depth, gravity, float(color_frame.timestamp) * 1e-3)
+                self._event.set()
             return
         if not self._gyro_ready or not frame.is_motion_frame():
             return
@@ -306,6 +306,12 @@ class RealSenseSource:
         except Exception:
             return
 
+    def set_color_lock(self, color_lock: dict) -> None:
+        """运行中切换光线档位，不重启相机取流。"""
+        self._color_lock = dict(color_lock)
+        if getattr(self, 'profile', None) is not None:
+            self._lock_color()
+
     def _lock_color(self) -> None:
         # 自动曝光在平台移动时会连跳，颜色阈值跟着漂。锁定曝光和白平衡。
         # 关掉自动后若留着默认曝光和增益，白天会把红蓝冲成接近白色。
@@ -327,13 +333,16 @@ class RealSenseSource:
         # 等到回调写好一帧再取出。超时说明彩色或深度没来。
         if not self._event.wait(timeout=5.0):
             raise RuntimeError("missing color or depth frame")
-        self._event.clear()
         with self._lock:
             pending = self._pending
             self._pending = None
-        if pending is None:
-            raise RuntimeError("missing color or depth frame")
-        color, depth, gravity, gyro = pending
+            self._event.clear()
+            if pending is None:
+                raise RuntimeError("missing color or depth frame")
+            color, depth, gravity, color_stamp = pending
+            gyro = []
+            while self._gyro and self._gyro[0][0] <= color_stamp:
+                gyro.append(self._gyro.popleft())
         return Frame(color=color, depth=depth, gravity=gravity, gyro=gyro)
 
     def close(self) -> None:

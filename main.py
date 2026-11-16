@@ -1,8 +1,6 @@
-"""入口：由 D435i 的一帧估计地面方块在当前相机坐标系下的 x、y 和 yaw。
+"""入口：地面方块相对当前小车右前点的位姿。
 
-原点是当前相机姿态下的右前点：沿相机向右 0.211 m、向后 0.05 m、沿相机朝下 0.70 m。
-X 为相机右方，Y 为相机前方，Z 为相机上方。车转动、俯仰或被推走时，原点跟着相机走。
-已转过的角度不累加，也不把位姿拉回起步点。
+X向车右、Y向车前、Z向上；按本帧重力补偿相机俯仰，不使用CAN、雷达或起步位姿。
 
 方块位置和 yaw 都来自地面足迹，不拟合上表面。上表面 RMS、与地面的 12° 夹角、
 6 mm 正方形残差没有对应平面，不参与丢帧。足迹的长边、短边和面积仍然丢帧。
@@ -18,6 +16,9 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+
+from field.body import body_extrinsic
+from angle_feedback import RelativeStop
 
 from camera.source import Frame, RealSenseSource, color_lock_from_config, filter_depth, list_camera_serials
 from cube.aim import (
@@ -80,7 +81,7 @@ def _ground_up_ok(plane, rotation: np.ndarray, initial_up: np.ndarray | None = N
 
 
 def pose_to_world(pose, rotation: np.ndarray, translation: np.ndarray, plane, height: float) -> dict:
-    # 足迹中心在地面上。沿地面法向抬 h/2 得到几何中心，再变到当前相机的右前点坐标系。
+    # 足迹中心在地面上。沿地面法向抬 h/2 得到几何中心，再变到当前小车的右前点坐标系。
     # 没有上表面，不能按顶面公式再减一次半高。
     center = pose.bottom_center + plane.normal * (0.5 * height)
     world = camera_to_world(center, rotation, translation)
@@ -485,7 +486,7 @@ def _record(fused, samples: list[dict]) -> dict:
     # yaw 用弧度。质量里只留内点数和 yaw 散布。
     # 上表面 RMS、12° 法向、6 mm 正方形残差没有平面可算，不放进 quality，也不用它们丢帧。
     return {
-        "frame": "world",
+        "frame": "car_front_right",
         "x": fused.x,
         "y": fused.y,
         "z": fused.z,
@@ -506,6 +507,17 @@ def with_view(payload: dict | None, view: dict) -> dict:
     return body
 
 
+def completed_view(session) -> dict:
+    return {"visible": True, "ready": True, "reason": "trial_complete",
+            "motion_started": False, "motion_active": False, "motion_arrived": False,
+            "motion_status": "停止！" + session.status}
+
+
+def trial_result_line(record, status) -> str:
+    return (f"第{record.index}次识别完成：相对小车右前点 "
+            f"X={record.x:+.3f} m，Y={record.y:+.3f} m，yaw={np.degrees(record.yaw):+.1f}°；{status}")
+
+
 def seek_ready(miss_frames: int, ground_miss: int, need: int = 6) -> tuple[bool, bool]:
     # 连续失败没到 need 帧时不转。地面失败也连续达到 need 时，只微调俯仰。
     armed = int(miss_frames) >= int(need)
@@ -522,6 +534,8 @@ def _fresh_reject(before: dict, after: dict) -> str | None:
 
 
 def _view_active(view: dict) -> bool:
+    if view.get("motion_status"):
+        return True
     # 给操作者看的转动指令。坐标不走这里，稳定后的 x、y、yaw 单独写入结果文件。
     for key in ("pitch", "yaw", "seek_pitch", "seek_yaw", "footprint_pitch", "footprint_yaw"):
         move = view.get(key) or {}
@@ -550,9 +564,10 @@ def _view_for_frame(
     pitch_room: float | None = None,
     yaw_room: float | None = None,
     yaw_bias: float = 1.0,
+    target_mask=None,
 ) -> dict:
     # 已经识别出来时，只有被画面边切到才给 pitch、yaw。
-    # 连续几帧没有位姿之后，转角每拍最多 2.5°，俯仰只要还要转就是 5°。
+    # 连续几帧没有位姿之后，转角每拍最多 5°，俯仰只要还要转就是 5°。
     # 绿线稳定而足迹失败时改走 footprint_，不和 seek_ 混用。
     return plan_view(
         color,
@@ -570,7 +585,19 @@ def _view_for_frame(
         pitch_room=pitch_room,
         yaw_room=yaw_room,
         yaw_bias=yaw_bias,
+        target_mask=target_mask,
     ).as_dict()
+
+
+def paint_progress_notice(preview, motion_status, trial_status):
+    from view_cube_center import paint_notice
+    left = preview[:, :preview.shape[1] // 2]
+    if motion_status:
+        paint_notice(left, motion_status)
+    if trial_status:
+        # 单独一行显示完成/等待，不被停止提示覆盖。
+        top = left[:-44] if left.shape[0] > 88 else left
+        paint_notice(top, trial_status)
 
 
 def _show_test_view(
@@ -587,6 +614,7 @@ def _show_test_view(
     rival_masks: list | None = None,
     frame_reject: str | None = None,
     status: str = "",
+    body_transform=None,
 ) -> bool:
     # 和 view_cube_center 同一套画面：橙线是地面，绿线是颜色轮廓，青线是足迹，黄十字是体心。
     # 没有显示器时不打断取流。按下 q 或 Esc 时返回真，调用方结束循环。
@@ -659,16 +687,16 @@ def _show_test_view(
             ahead, side, above_top, _ground_yaw = readout
             lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
             lines.append(f"above top={above_top:+.3f} m")
-        mount_r, mount_t = camera_corner_extrinsic()
+        mount_r, mount_t = body_transform if body_transform is not None else body_extrinsic(-plane.normal, cfg)
         world = camera_to_world(body, mount_r, mount_t)
         edge_w = mount_r.T @ edge
         yaw = fold_yaw_quarter(float(np.arctan2(edge_w[1], edge_w[0])))
         lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
         lines.append(
-            f"world x={float(world[0]):+.3f} m   y={float(world[1]):+.3f} m   z={float(world[2]):+.3f} m"
+            f"car x={float(world[0]):+.3f} m   y={float(world[1]):+.3f} m   z={float(world[2]):+.3f} m"
         )
     if pose and "x" in pose:
-        lines.append(f"world x={pose['x']:.3f}  y={pose['y']:.3f}  yaw={pose['yaw']:.3f}")
+        lines.append(f"recorded x={pose['x']:.3f}  y={pose['y']:.3f}  yaw={pose['yaw']:.3f}")
     pitch = view.get("pitch") or {}
     turn = view.get("yaw") or {}
     if pitch.get("direction") not in (None, "none") or turn.get("direction") not in (None, "none"):
@@ -698,8 +726,7 @@ def _show_test_view(
             cv2.cvtColor(cv2.resize(mask_view, half, interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR),
         ]
     )
-    if status:
-        paint_notice(preview[:, : half[0]], status)
+    paint_progress_notice(preview, view.get("motion_status", ""), status)
     try:
         cv2.imshow("cube center", preview)
         key = cv2.waitKey(1) & 0xFF
@@ -710,7 +737,7 @@ def _show_test_view(
 
 # --- 实机循环 -----------------------------------------------------------------
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
-# 输出坐标固定在当前相机上，原点是右前点。不按重力摆平，也不跟踪起步位置。
+# 输出坐标固定在当前车身，原点是右前点。按本帧重力补偿俯仰，不跟踪起步位置。
 # 合格样本满 min_samples 帧才在画面上给出估计。正式的 x、y、yaw 另计：
 # 本次观察满 min_trial_s，并且连续 stable_frames 帧的位置和 yaw 都稳定，才写入结果文件。
 # 单条达到 10° 的转动指令、丢帧，或相邻帧地面中心跳过 3 cm，都会清空这一窗。15 秒不因此重计。
@@ -750,8 +777,9 @@ def run_live(
     headless: bool = False,
 ) -> None:
     # 实机循环。标定分支写完文件就返回。识别分支把稳定后的 x、y、yaw 写入结果文件。
-    # basic 和 field 都用当前相机的右前点，mode 不再切换跟踪。
+    # basic 和 field 都相对当前车身右前点，不累计起步位姿。
     _ = mode
+    feedback = RelativeStop()
     source = RealSenseSource(
         intr.width,
         intr.height,
@@ -767,6 +795,7 @@ def run_live(
     last_record: dict | None = None
     fail_since: float | None = None
     last_print = 0.0
+    last_motion_text = None
     last_plane = None
     last_translation = None
     rejects: dict[str, int] = {}
@@ -845,9 +874,8 @@ def run_live(
                 return
             frame = Frame(frame.color, depth, frame.gravity, frame.gyro)
             now = time.monotonic()
-            # 地面仍用重力拟合。输出轴不跟重力走，固定在当前相机上。
+            # 地面拟合与车身坐标使用同一帧重力。
             gravity = frame.gravity if frame.gravity is not None else np.array([0.0, 1.0, 0.0])
-            rotation, translation = camera_corner_extrinsic()
             plane_fresh = _acquire_plane(depth, intr, cfg, gravity, None if turning else stable_plane)
             plane, stable_plane, stable_left = reuse_stable_plane(
                 plane_fresh,
@@ -859,17 +887,15 @@ def run_live(
             )
             turning = False
             reject_before = dict(rejects)
-            worlds = estimate_candidates(
-                frame,
-                intr,
-                cfg,
-                rotation,
-                translation,
-                rejects,
-                None,
-                plane,
-                check_up=False,
-            )
+            try:
+                rotation, translation = body_extrinsic(frame.gravity, cfg, plane)
+            except ValueError:
+                _bump(rejects, "attitude")
+                worlds = []
+            else:
+                worlds = estimate_candidates(
+                    frame, intr, cfg, rotation, translation, rejects, None, plane,
+                )
             frame_reject = None if worlds else _fresh_reject(reject_before, rejects)
             origin = None
             if worlds:
@@ -983,20 +1009,32 @@ def run_live(
                 )
             pitch_room = max(0.0, seek_limit - abs(seek_pitch_sum))
             yaw_room = max(0.0, seek_limit - abs(seek_yaw_sum))
-            view = _view_for_frame(
-                frame.color,
-                depth,
-                intr,
-                cfg,
-                aim_gravity,
-                pose_ok,
-                armed,
-                ground_lost=ground_lost,
-                footprint_lost=footprint_lost,
-                pitch_room=pitch_room,
-                yaw_room=yaw_room,
-                yaw_bias=footprint_yaw_sign,
-            )
+            if session.phase in ("wait", "done"):
+                feedback.cancel()
+                view = completed_view(session)
+            elif pose_ok and chosen_mask is None:
+                # 已有位姿但本帧无目标掩膜，不改用整幅红地板发动作。
+                feedback.cancel()
+                view = {"visible": True, "ready": True, "reason": "holding",
+                        "motion_active": False, "motion_arrived": False,
+                        "motion_status": "停止，保持当前角度，等待目标确认"}
+            else:
+                view = _view_for_frame(
+                    frame.color,
+                    depth,
+                    intr,
+                    cfg,
+                    aim_gravity,
+                    pose_ok,
+                    armed,
+                    ground_lost=ground_lost,
+                    footprint_lost=footprint_lost,
+                    pitch_room=pitch_room,
+                    yaw_room=yaw_room,
+                    yaw_bias=footprint_yaw_sign,
+                    target_mask=chosen_mask,
+                )
+                view = feedback.apply(view, frame.gravity, frame.gyro)
             if view.get("reason") in ("footprint_edge", "footprint_center"):
                 last_footprint_clipped = dict(view.get("clipped") or {})
                 last_footprint_reason = view.get("reason")
@@ -1007,10 +1045,10 @@ def run_live(
                 last_footprint_sweep = False
             pitch_delta = _axis_delta(view, "seek_pitch") + _axis_delta(view, "footprint_pitch")
             yaw_delta = _axis_delta(view, "seek_yaw") + _axis_delta(view, "footprint_yaw")
-            if pitch_delta != 0.0:
+            if pitch_delta != 0.0 and view.get("motion_started"):
                 seek_pitch_sum += pitch_delta
                 turning = True
-            if yaw_delta != 0.0:
+            if yaw_delta != 0.0 and view.get("motion_started"):
                 seek_yaw_sum += yaw_delta
                 turning = True
             # 贴边时的整段转角也会让车转。转过之后画面变了，地面不能沿用。角度不写进坐标。
@@ -1029,10 +1067,15 @@ def run_live(
             if record is not None:
                 text = record.text() if result_file is None else append_trial(result_file, record)
                 print(text, end="", flush=True)
-            if now - last_print >= output_period and _view_active(view):
-                # 转动指令仍然打出来。x、y、yaw 只在上面那一次写入，不按 output_hz 重复。
-                print(json.dumps(with_view({}, view)))
+                print(trial_result_line(record, session.status), flush=True)
+                feedback.cancel()
+                view = completed_view(session)
+            motion_text = view.get("motion_status")
+            if now - last_print >= output_period and _view_active(view) and motion_text != last_motion_text:
+                # 状态不变不刷屏，让坐标及“识别完成”保留在终端。
+                print(motion_text or json.dumps(with_view({}, view), ensure_ascii=False), flush=True)
                 last_print = now
+                last_motion_text = motion_text
             tick = time.monotonic()
             vis_fps = 1.0 / max(tick - vis_last, 1e-3)
             vis_last = tick
@@ -1059,9 +1102,10 @@ def run_live(
                 rival_masks,
                 frame_reject,
                 session.status,
+                body_transform=(rotation, translation),
             ):
                 return
-            if rejects != logged_rejects:
+            if debug and rejects != logged_rejects:
                 print(json.dumps({"reject_counts": rejects}), file=sys.stderr)
                 logged_rejects = dict(rejects)
     except KeyboardInterrupt:
@@ -1089,7 +1133,7 @@ def main() -> None:
     parser.add_argument("--calibrate", action="store_true")
     parser.add_argument("--calibrate-color", action="store_true")
     parser.add_argument("--light", default=None, help="亮度档：bright、daylight、indoor、dim、dark")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--debug", action="store_true", help="在终端输出累计拒绝计数，供排查识别问题")
     parser.add_argument("--headless", action="store_true", help="SSH无窗口识别，终端输出结果，Ctrl+C退出")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()

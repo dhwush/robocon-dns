@@ -2,7 +2,7 @@
 
 体心是地面足迹中心沿地面法向抬起半个边长，与正式输出的几何中心同一点。
 橙色线是拟合地面上最大的一块，内点放宽到 18 mm。画面写出地面上的前方距离、左右距离和地面 yaw。
-另一行是当前相机右前点坐标系里的体心。轴跟着相机：向右 X、向前 Y、向上 Z。按 q 或 Esc 退出。
+另一行是当前小车右前点坐标系里的体心。俯仰由重力补偿：车右 X、车前 Y、向上 Z。按 1–5 实时切换光线档位：很亮、白天、室内、偏暗、很暗。按 q 或 Esc 退出。
 
     python view_cube_center.py
 """
@@ -25,7 +25,7 @@ from cube.detect import (
     render_color_standard,
     show_color_standard,
 )
-from field.extrinsic import camera_corner_extrinsic
+from field.body import body_extrinsic
 from geom.transform import camera_to_world, deproject_pixels, fold_yaw_quarter, project_points
 from ground.plane import fit_ground, plane_holds, sample_points
 from main import live_intrinsics, load_config
@@ -238,11 +238,11 @@ def _glyph(face_ptr, library, code: int):
     return pixels, int(slot.bitmap_left), int(slot.bitmap_top), max(int(slot.advance.x >> 6), width)
 
 
-def paint_notice(image: np.ndarray, text: str) -> None:
+def paint_notice(image: np.ndarray, text: str, font_size: int = 32) -> None:
     """在画面底部写中文提示。没有字体时保持原图。"""
     if not text:
         return
-    opened = _open_cjk(32)
+    opened = _open_cjk(font_size)
     if opened is None:
         return
     library, face_ptr, _face = opened
@@ -251,7 +251,7 @@ def paint_notice(image: np.ndarray, text: str) -> None:
     for char in text:
         glyph = _glyph(face_ptr, library, ord(char))
         if glyph is None:
-            pen += 32
+            pen += font_size
             continue
         if glyph[0] is None:
             pen += int(glyph[1])
@@ -329,6 +329,8 @@ def main() -> None:
     parser.add_argument("--light", default=None, help="亮度档：bright、daylight、indoor、dim、dark")
     args = parser.parse_args()
     cfg = load_config("config/default.yaml")
+    light_names = ('bright', 'daylight', 'indoor', 'dim', 'dark')
+    light_labels = ('很亮', '白天', '室内', '偏暗', '很暗')
     color_lock = color_lock_from_config(cfg, args.light)
     serial, intr = live_intrinsics()
     source = RealSenseSource(
@@ -431,13 +433,13 @@ def main() -> None:
                         ahead, side, above_top, _ground_yaw = readout
                         lines.append(f"ahead={ahead:+.3f} m   right={side:+.3f} m")
                         lines.append(f"above top={above_top:+.3f} m")
-                    mount_r, mount_t = camera_corner_extrinsic()
+                    mount_r, mount_t = body_extrinsic(frame.gravity, cfg, plane)
                     world = camera_to_world(body, mount_r, mount_t)
                     edge_w = mount_r.T @ np.asarray(pose.edge_direction, dtype=float)
                     yaw = fold_yaw_quarter(float(np.arctan2(edge_w[1], edge_w[0])))
                     lines.append(f"yaw={np.degrees(yaw):+.1f} deg")
                     lines.append(
-                        f"world x={float(world[0]):+.3f} m   y={float(world[1]):+.3f} m   z={float(world[2]):+.3f} m"
+                        f"car x={float(world[0]):+.3f} m   y={float(world[1]):+.3f} m   z={float(world[2]):+.3f} m"
                     )
             _label(vis, lines)
             chart = render_color_standard(
@@ -455,6 +457,10 @@ def main() -> None:
                     cv2.cvtColor(cv2.resize(mask_view, half, interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR),
                 ]
             )
+            active = next((i for i, name in enumerate(light_names) if name == color_lock['name']), None)
+            current_light = (f'{active + 1} {light_labels[active]}' if active is not None else color_lock['name'])
+            paint_notice(preview, f'光线 {current_light}；1很亮 2白天 3室内 4偏暗 5很暗',
+                         font_size=max(14, min(24, preview.shape[1] // 42)))
             cv2.imshow("cube center", preview)
             now = time.monotonic()
             fps = 1.0 / max(now - last, 1e-3)
@@ -462,6 +468,11 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            if ord('1') <= key <= ord('5'):
+                updated = color_lock_from_config(cfg, light_names[key - ord('1')])
+                source.set_color_lock(updated)
+                color_lock = updated
+
     finally:
         source.close()
         cv2.destroyAllWindows()

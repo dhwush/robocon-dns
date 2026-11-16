@@ -1,9 +1,6 @@
-"""用矩形场地的边求相机外参。
+"""场地边标定辅助。实机输出统一使用 field.body 的当前车身右前点坐标。
 
-场地边标定的原点是靠近相机的那个角，X 沿长边，Y 沿短边，Z 向上。
-实机输出用 camera_corner_extrinsic：原点是当前相机姿态下的右前点，轴跟着相机，不靠重力摆平。
-提高要求只要求挪走相机后仍给出世界系位姿。安装方向和文档 2.3 的水平向前不一致时，
-继续用这里求出的外参，不换成那组固定旋转，也不改用 AprilTag。
+基础和提高都不累计起步位置；场地边标定函数保留给离线验证，不改变实机输出原点。
 """
 
 from __future__ import annotations
@@ -51,11 +48,11 @@ class Segment:
 
 # 小车在地面时，彩色光心在世界系中的位置。世界原点是右前角。
 # 光心比地面标记偏右 3.5 cm、偏前 5 cm；标记再沿 X 向右 17.6 cm 是右前角。
-# 相对光心，原点在右侧 21.1 cm、后方 5 cm、下方 70 cm。
+# 相对光心，原点在右侧 21.1 cm、后方 5 cm、下方 67.5 cm。
 MARK_RIGHT_OF_CAMERA_M = 0.035
 CORNER_RIGHT_OF_MARK_M = 0.176
 MARK_BEHIND_CAMERA_M = 0.05
-CAMERA_HEIGHT_M = 0.70
+CAMERA_HEIGHT_M = 0.675
 OPTICAL_CENTER_IN_WORLD = np.array(
     [
         -(MARK_RIGHT_OF_CAMERA_M + CORNER_RIGHT_OF_MARK_M),
@@ -71,15 +68,11 @@ def identity_extrinsic() -> tuple[np.ndarray, np.ndarray]:
     return np.eye(3), np.zeros(3)
 
 
-def camera_corner_extrinsic() -> tuple[np.ndarray, np.ndarray]:
-    # 轴固定在当前相机上，不看重力，也不扣已经转过的角。
-    # 光学系是 X 右、Y 下、Z 前。输出 X 向右、Y 向前、Z 向上。
-    # 原点在光心右侧 0.211 m、后方 0.05 m、沿相机朝下 0.70 m。车一动，这个点跟着走。
-    right = np.array([1.0, 0.0, 0.0])
-    forward = np.array([0.0, 0.0, 1.0])
-    up = np.array([0.0, -1.0, 0.0])
-    rotation = np.column_stack([right, forward, up])
-    return rotation, -rotation @ OPTICAL_CENTER_IN_WORLD
+def camera_corner_extrinsic(gravity=None, cfg=None) -> tuple[np.ndarray, np.ndarray]:
+    """当前车身右前点；无参数仅表示相机水平的兼容调用。实机必须传本帧重力。"""
+    from field.body import body_extrinsic
+    down = np.array([0., 1., 0.]) if gravity is None else gravity
+    return body_extrinsic(down, cfg)
 
 
 def level_extrinsic(gravity: np.ndarray, yaw: float = 0.0, *, mounted: bool = True) -> tuple[np.ndarray, np.ndarray]:
