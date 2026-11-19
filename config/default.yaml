@@ -21,19 +21,32 @@ size_tolerance: 0.06
 frames_to_fuse: 15
 min_samples: 5
 output_hz: 10
+# 连续调整超过此时间仍未到位，停止并要求检查机构/重新放置目标。
+adjust_timeout_s: 10.0
 # 一次摆放从开始观察起至少这么久。时间未到时，即使窗口已经稳定也不写结果。
 min_trial_s: 15
-# 连续这么多帧里，x、y 相对中值的偏差都不超过 stable_xy_m，yaw 标准差不超过 stable_yaw_deg。
-stable_frames: 15
-stable_xy_m: 0.010
-stable_yaw_deg: 1.5
+# 最近6秒内取10个有效检测，最多剔除2个异常样本；本帧必须合格才能提交。
+stable_frames: 10
+stable_xy_m: 0.020
+stable_yaw_deg: 2.5
+stable_max_outliers: 2
+stable_window_s: 6.0
+# 最多连续漏检2帧，距上一有效检测不超过1秒时保留窗口。
+stable_miss_frames: 2
+stable_gap_s: 1.0
+# 目标中心改变超过5cm且连续3帧在新位置，才丢弃旧窗口。
+sample_jump_m: 0.05
+sample_jump_frames: 3
 # 写出后，地面中心离开超过这个距离并持续 trial_move_frames 帧，下一次才重新计时。
 trial_move_m: 0.08
 trial_move_frames: 6
 trial_count: 3
 result_path: results/cube_trials.txt
 hold_s: 0.5
+# 相机系地面缓存仍按3cm处理；车身系地面变化需超过5cm并持续3帧才清窗。
 jump_m: 0.03
+plane_change_m: 0.05
+plane_jump_frames: 3
 fps: 30
 # 自动曝光关闭。按环境选一档，亮处压曝光以免红蓝冲白，暗处再抬曝光、增益和亮度偏移。
 # 曝光单位是微秒。超出相机允许范围时会夹到设备上下限。

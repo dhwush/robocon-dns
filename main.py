@@ -47,7 +47,7 @@ from field.extrinsic import (
 from fuse.median import average_scores, fuse_poses, score_trial
 from fuse.trial import TrialSession, append_trial, command_blocks_commit, open_trial_file
 from geom.transform import camera_to_world, fold_yaw_quarter, load_intrinsics, load_intrinsics_for_serial
-from ground.plane import fit_ground, plane_holds, reuse_stable_plane, sample_points
+from ground.plane import PlaneChangeGuard, fit_ground, plane_holds, reuse_stable_plane, sample_points
 
 # --- 单帧估计 -----------------------------------------------------------------
 # 深度清洗 → 地面 → 可见面位姿 →（可选）看不清面时的补救 → 变到世界系。
@@ -739,14 +739,14 @@ def _show_test_view(
 # --calibrate 只把场地角外参存盘，不作为实机世界系。--calibrate-color 用 30 帧收紧 HSV。
 # 输出坐标固定在当前车身，原点是右前点。按本帧重力补偿俯仰，不跟踪起步位置。
 # 合格样本满 min_samples 帧才在画面上给出估计。正式的 x、y、yaw 另计：
-# 本次观察满 min_trial_s，并且连续 stable_frames 帧的位置和 yaw 都稳定，才写入结果文件。
-# 单条达到 10° 的转动指令、丢帧，或相邻帧地面中心跳过 3 cm，都会清空这一窗。15 秒不因此重计。
+# 本次观察满 min_trial_s，近期窗口内有足够稳定样本，才写入结果文件。
+# 短暂漏检保留窗口，实际调整/持续换位仍清窗；15秒观察计时不因此重计。
 # 写出后画面显示换位置。方块离开 trial_move_m 并持续 trial_move_frames 帧，或丢失超过 1 秒后再出现，下一次才计时。
 # 写满 trial_count 后不再追加。已经识别出来时，只有方块被画面边切掉才给出俯仰和原地转角。
-# 连续 seek_miss_frames 帧没有位姿，才微调。转角每拍最多 2.5°，俯仰只要还要转就是 5°。
+# 连续 seek_miss_frames 帧没有位姿，才微调。转角每拍最多5°，俯仰只要还要转就是5°。
 # 地面还在、绿线连续停在一处、足迹失败时，改输出 footprint_pitch、footprint_yaw。
 # 相机没转时，地面拟合失败或原点跳变的几帧沿用上一块合格平面。一开始俯仰或原地转就丢掉它。
-# 地面或外参平移跳过 30 mm 时清空缓冲。
+# 车身系地面原点持续变化才清窗，不用随俯仰改变的相机系外参t判定平移。
 # 失败后 0.5 s 内重复上一结果，再失败则画面上不再沿用。丢帧原因累加后写到标准错误。
 
 def live_intrinsics(serial: str | None = None):
@@ -779,7 +779,7 @@ def run_live(
     # 实机循环。标定分支写完文件就返回。识别分支把稳定后的 x、y、yaw 写入结果文件。
     # basic 和 field 都相对当前车身右前点，不累计起步位姿。
     _ = mode
-    feedback = RelativeStop()
+    feedback = RelativeStop(timeout_s=float(cfg.get("adjust_timeout_s", 10.0)))
     source = RealSenseSource(
         intr.width,
         intr.height,
@@ -796,12 +796,12 @@ def run_live(
     fail_since: float | None = None
     last_print = 0.0
     last_motion_text = None
-    last_plane = None
-    last_translation = None
     rejects: dict[str, int] = {}
     logged_rejects = {}
     hold_s = float(cfg.get("hold_s", 0.5))
     jump_m = float(cfg.get("jump_m", 0.03))
+    plane_change = PlaneChangeGuard(float(cfg.get("plane_change_m", 0.05)),
+                                   int(cfg.get("plane_jump_frames", 3)))
     min_samples = int(cfg.get("min_samples", 5))
     stable_plane = None
     stable_left = 0
@@ -810,6 +810,7 @@ def run_live(
     ground_miss = 0
     seek_pitch_sum = 0.0
     seek_yaw_sum = 0.0
+    search_tracking = {"pitch": False, "yaw": False}
     contour_samples: list = []
     footprint_hold = False
     footprint_yaw_sign = 1.0
@@ -832,6 +833,12 @@ def run_live(
     try:
         while True:
             frame = source.read()
+            observation = feedback.observe(frame.gravity, frame.gyro)
+            # 搜索额度只扣实际测到的转动；未执行的建议不能当成已转过。
+            if search_tracking["pitch"] and observation["delta"]["pitch"] is not None:
+                seek_pitch_sum += observation["delta"]["pitch"]
+            if search_tracking["yaw"] and observation["delta"]["yaw"] is not None:
+                seek_yaw_sum += observation["delta"]["yaw"]
             depth = filter_depth(frame.depth, cfg["depth_min"], cfg["depth_max"], cfg["flying_pixel_m"])
             if not headless:
                 chart = render_color_standard(
@@ -902,15 +909,7 @@ def run_live(
                 origin = np.asarray(worlds[0].pop("plane_origin"), dtype=float)
                 for world in worlds[1:]:
                     world.pop("plane_origin", None)
-            moved = False
-            if origin is not None and last_plane is not None and np.linalg.norm(origin - last_plane) > jump_m:
-                moved = True
-            if (
-                translation is not None
-                and last_translation is not None
-                and np.linalg.norm(np.asarray(translation) - last_translation) > jump_m
-            ):
-                moved = True
+            moved = plane_change.update(origin)
             if moved:
                 samples.clear()
                 last_record = None
@@ -939,10 +938,6 @@ def run_live(
             if sample is not None:
                 for key in ("footprint_fraction", "long_side", "short_side", "peak"):
                     sample.pop(key, None)
-            if origin is not None:
-                last_plane = origin
-            if translation is not None:
-                last_translation = np.asarray(translation, dtype=float).copy()
             if sample is None:
                 if replay is not None:
                     payload = replay
@@ -1034,7 +1029,8 @@ def run_live(
                     yaw_bias=footprint_yaw_sign,
                     target_mask=chosen_mask,
                 )
-                view = feedback.apply(view, frame.gravity, frame.gyro)
+                view = feedback.apply(view, frame.gravity, observation=observation,
+                                      target_changed=jumped and previous_blob is not None and blob is not None)
             if view.get("reason") in ("footprint_edge", "footprint_center"):
                 last_footprint_clipped = dict(view.get("clipped") or {})
                 last_footprint_reason = view.get("reason")
@@ -1045,12 +1041,9 @@ def run_live(
                 last_footprint_sweep = False
             pitch_delta = _axis_delta(view, "seek_pitch") + _axis_delta(view, "footprint_pitch")
             yaw_delta = _axis_delta(view, "seek_yaw") + _axis_delta(view, "footprint_yaw")
-            if pitch_delta != 0.0 and view.get("motion_started"):
-                seek_pitch_sum += pitch_delta
-                turning = True
-            if yaw_delta != 0.0 and view.get("motion_started"):
-                seek_yaw_sum += yaw_delta
-                turning = True
+            search_tracking = {"pitch": pitch_delta != 0.0, "yaw": yaw_delta != 0.0}
+            turning = any(abs(_axis_delta(view, key)) > 0.0
+                          for key in ("pitch", "seek_pitch", "footprint_pitch"))
             # 贴边时的整段转角也会让车转。转过之后画面变了，地面不能沿用。角度不写进坐标。
             full_yaw = (
                 _axis_delta(view, "yaw")
@@ -1071,8 +1064,11 @@ def run_live(
                 feedback.cancel()
                 view = completed_view(session)
             motion_text = view.get("motion_status")
-            if now - last_print >= output_period and _view_active(view) and motion_text != last_motion_text:
-                # 状态不变不刷屏，让坐标及“识别完成”保留在终端。
+            if _view_active(view) and (
+                (now - last_print >= output_period and motion_text != last_motion_text)
+                or now - last_print >= 2.0
+            ):
+                # 即使状态不变也每两秒显示一次，便于区分等待与程序停滞。
                 print(motion_text or json.dumps(with_view({}, view), ensure_ascii=False), flush=True)
                 last_print = now
                 last_motion_text = motion_text

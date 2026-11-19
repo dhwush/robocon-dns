@@ -88,7 +88,7 @@ def test_two_fps_rotation_integrates_whole_interval_and_reaches_three_degrees():
     frame=source.read()
     feedback.apply({},g,frame.gyro)
     command=dict(visible=True,ready=False,gravity_assumed=False,
-                 yaw=dict(direction='right',degrees=10.,signed_radians=math.radians(10.)))
+                 seek_yaw=dict(direction='right',degrees=10.,signed_radians=math.radians(10.)))
     feedback.apply(command,g,[])
     for i in range(2,102):
         stamp=i*.005

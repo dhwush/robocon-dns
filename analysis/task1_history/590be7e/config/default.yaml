@@ -1,0 +1,58 @@
+mode: basic
+cube_size: 0.2
+field_length: 2.0
+field_width: 1.2
+depth_min: 0.3
+depth_max: 3.0
+flying_pixel_m: 0.08
+# 地面 RANSAC。方块投影到这块地面上，不另拟合上表面，因此不算顶面 RMS、12° 法向和 6 mm 残差。
+ground_ransac_thresh: 0.008
+ground_ransac_iterations: 50
+# 地面是大平面。步长 8 大约 1.4 万点，够判断 8° 夹角和 5% 内点。
+ground_stride: 8
+ground_max_angle_deg: 8.0
+min_face_pixels: 400
+# 足迹面积低于这个比例就丢帧。近处长边按 24 mm，更远按 max(24 mm, 0.02*z) 且不超过 size_tolerance。
+# 短边短于 0.45 倍边长也丢帧。
+min_footprint_fraction: 0.45
+# 长边门限是 min(这个值, max(0.12 * cube_size, 0.02*z))。近处仍是 24 mm，2 m 约 4 cm，3 m 约 6 cm。
+# 高度检查用的是这个值再加 5 cm，不能再留 0.18 m，否则比边长还宽。
+size_tolerance: 0.06
+frames_to_fuse: 15
+min_samples: 5
+output_hz: 10
+hold_s: 0.5
+jump_m: 0.03
+fps: 30
+# 自动曝光关闭。按环境选一档，亮处压曝光以免红蓝冲白，暗处再抬曝光、增益和亮度偏移。
+# 曝光单位是微秒。超出相机允许范围时会夹到设备上下限。
+light: daylight
+light_levels:
+  bright: {exposure: 25, gain: 0, brightness: -16}
+  daylight: {exposure: 50, gain: 16, brightness: 0}
+  indoor: {exposure: 150, gain: 28, brightness: 0}
+  dim: {exposure: 400, gain: 48, brightness: 12}
+  dark: {exposure: 1200, gain: 72, brightness: 24}
+hsv_calib_frames: 30
+hsv_path: config/hsv.yaml
+extrinsic_path: config/extrinsic.yaml
+# 提高要求：场地边丢失后，视觉或陀螺还能维持这么久；再久就停止输出，直到重新锁定。
+track_hold_s: 0.3
+track_vo_thresh_m: 0.02
+track_min_points: 12
+# 基本要求不调用掠射补救。补救不是顶面拟合，打开后也只在可见面检测拒绝时才跑。
+enable_face_fallback: false
+# 方块上半纯红、下半纯蓝，分界绕四周，不是某一面的朝向标记。两色都进掩膜，都不标 front。
+colors:
+  - name: red
+    hsv_low: [0, 80, 60]
+    hsv_high: [10, 255, 255]
+    front: false
+  - name: red_high
+    hsv_low: [170, 80, 60]
+    hsv_high: [180, 255, 255]
+    front: false
+  - name: blue
+    hsv_low: [100, 80, 60]
+    hsv_high: [130, 255, 255]
+    front: false

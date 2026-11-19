@@ -1,9 +1,11 @@
 # 方块只露出一部分时，俯仰和原地转角的方向、大小。
 
 import numpy as np
+import pytest
 
 from cube.aim import plan_view
 from geom.transform import Intrinsics
+from angle_feedback import RelativeStop
 
 
 COLORS = [
@@ -52,6 +54,21 @@ def test_right_edge_turns_right():
     assert 0.35 < adjustment.yaw.radians < 0.7
     assert adjustment.yaw.signed_radians > 0.0
     assert adjustment.yaw.degrees == np.degrees(adjustment.yaw.radians)
+
+
+@pytest.mark.parametrize('pitch_deg', [-3.01, -3., -2.99, 2.99, 3., 3.01])
+@pytest.mark.parametrize('yaw_deg', [0., 20.])
+def test_planned_pitch_deadzone_has_explicit_stop_message(monkeypatch, pitch_deg, yaw_deg):
+    color, depth = _scene(280, 320, 100, 140)
+    monkeypatch.setattr('cube.aim._angles_toward',
+                        lambda *args: (np.deg2rad(pitch_deg), np.deg2rad(yaw_deg), False))
+    g = np.array([0., 1., 0.])
+    adjustment = plan_view(color, depth, _intr(), COLORS, gravity=g)
+    output = RelativeStop(clock=lambda: 0.).apply(adjustment.as_dict(), g)
+    arrived = abs(pitch_deg) <= 3.
+    assert (output['pitch']['direction'] == 'none') == arrived
+    assert ('俯仰可以了' in output['motion_status']) == arrived
+    assert output['motion_active'] == (not arrived or yaw_deg != 0.)
 
 
 def test_bottom_edge_pitches_down():

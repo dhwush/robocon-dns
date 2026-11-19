@@ -39,7 +39,7 @@ def test_pitch_stop_keeps_arrived_goal_before_asking_next():
     assert not stop.arrived
 
 
-@pytest.mark.parametrize('key', ['pitch','seek_pitch','footprint_pitch'])
+@pytest.mark.parametrize('key', ['seek_pitch','footprint_pitch'])
 def test_relative_pitch_target_is_fixed_until_three_degrees(key):
     now=[0.]
     stop=RelativeStop(clock=lambda:now[0])
@@ -56,7 +56,7 @@ def test_relative_pitch_target_is_fixed_until_three_degrees(key):
     assert drifted[key]['degrees']==pytest.approx(4)
 
 
-@pytest.mark.parametrize('key', ['yaw','seek_yaw','footprint_yaw'])
+@pytest.mark.parametrize('key', ['seek_yaw','footprint_yaw'])
 @pytest.mark.parametrize('sign', [-1,1])
 def test_rotation_uses_gyro_feedback_and_stops_at_three_degrees(key,sign):
     now=[0.]
@@ -82,3 +82,23 @@ def test_pending_small_motion_blocks_trial_commit_until_confirmed():
     from fuse.trial import command_blocks_commit
     assert command_blocks_commit({'motion_active': True, 'yaw': {'direction':'right','degrees':3.01}})
     assert not command_blocks_commit({'motion_active': False, 'motion_arrived': True})
+
+
+@pytest.mark.parametrize('key', ['pitch', 'seek_pitch', 'footprint_pitch'])
+@pytest.mark.parametrize('error', [-3.01, -3., -2.99, 2.99, 3., 3.01])
+def test_relative_pitch_deadzone_includes_both_three_degree_boundaries(key, error):
+    stop = RelativeStop(clock=lambda: 0.)
+    stop.apply(move(key, 10), gravity(0))
+    output = stop.apply(move(key, error if key == 'pitch' else 10), gravity(10-error))
+    arrived = abs(error) <= 3.
+    assert output['motion_arrived'] == arrived
+    assert ('俯仰可以了' in output['motion_status']) == arrived
+    assert (output[key]['direction'] == 'none') == arrived
+
+
+@pytest.mark.parametrize('reason', ['ground', 'unrecognized', 'waiting'])
+def test_no_pitch_command_without_alignment_does_not_claim_pitch_arrival(reason):
+    output = RelativeStop(clock=lambda: 0.).apply(
+        dict(visible=True, ready=True, reason=reason, gravity_assumed=False,
+             pitch=dict(direction='none', degrees=0.)), gravity(0))
+    assert '俯仰可以了' not in output['motion_status']

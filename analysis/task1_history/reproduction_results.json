@@ -1,0 +1,65 @@
+{
+  "boundary_chatter": [
+    "俯仰向上继续调整，剩余5.0°",
+    "俯仰可以了，停止！",
+    "俯仰向上继续调整，剩余3.4°",
+    "俯仰可以了，停止！"
+  ],
+  "target_disappears": {
+    "visible": false,
+    "ready": false,
+    "reason": "no_cube",
+    "motion_started": false,
+    "seek_pitch": {
+      "direction": "up",
+      "radians": 0.08726646259971647,
+      "degrees": 5.0,
+      "signed_radians": -0.08726646259971647
+    },
+    "motion_active": true,
+    "motion_arrived": false,
+    "motion_status": "俯仰向上继续调整，剩余5.0°"
+  },
+  "planner_left20_feedback_right15": {
+    "visible": true,
+    "ready": false,
+    "reason": "partial",
+    "gravity_assumed": false,
+    "yaw": {
+      "direction": "right",
+      "radians": 0.2617993877991494,
+      "degrees": 14.999999999999998,
+      "signed_radians": 0.2617993877991494
+    },
+    "motion_started": false,
+    "motion_active": true,
+    "motion_arrived": false,
+    "motion_status": "旋转向右继续调整，剩余15.0°"
+  },
+  "mixed_missing_feedback": {
+    "visible": true,
+    "ready": false,
+    "reason": "unrecognized",
+    "gravity_assumed": false,
+    "seek_pitch": {
+      "direction": "none",
+      "radians": 0.0,
+      "degrees": 0.0,
+      "signed_radians": 0.0
+    },
+    "seek_yaw": {
+      "direction": "none",
+      "radians": 0.0,
+      "degrees": 0.0,
+      "signed_radians": 0.0
+    },
+    "motion_started": true,
+    "motion_active": true,
+    "motion_arrived": false,
+    "motion_status": "俯仰向上继续调整，剩余10.0°；停止！角度反馈缺失，暂不能确认到位"
+  },
+  "sub10_command_blocks_commit": {
+    "status": "俯仰向上继续调整，剩余5.0°",
+    "blocks_commit": true
+  }
+}

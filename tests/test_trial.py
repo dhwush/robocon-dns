@@ -33,6 +33,8 @@ def test_stable_pose_waits_for_minimum_time():
     assert _fill(session, _pose(), 1.0) is None
     assert session.status == "还需 14 s"
     assert session.preview()["x"] == 0.2
+    for now in np.arange(1.25, 15., .25):
+        assert session.update(_pose(), float(now), False) is None
     record = session.update(_pose(), 15.0, False)
     assert record is not None
     assert record.index == 1
@@ -42,8 +44,9 @@ def test_stable_pose_waits_for_minimum_time():
 
 
 def test_spread_and_jump_and_motion_block_commit():
-    """位置散开、相邻帧跳过 3 cm，或有不小于 10° 的指令时，到时也不提交。"""
-    loose = TrialSession(min_trial_s=15, stable_frames=15)
+    """严格配置可拒绝散布；持续换位或真实调整不能借用旧位置窗口提交。"""
+    loose = TrialSession(min_trial_s=15, stable_frames=15, stable_xy_m=.010,
+                         stable_max_outliers=0)
     loose.begin(0.0)
     for index in range(15):
         offset = 0.012 if index % 2 else 0.0
@@ -53,8 +56,8 @@ def test_spread_and_jump_and_motion_block_commit():
     jumped = TrialSession(min_trial_s=15, stable_frames=15)
     jumped.begin(0.0)
     assert _fill(jumped, _pose(), 20.0, frames=14) is None
-    assert jumped.update(_pose(x=0.25), 20.0, False) is None
-    assert jumped.update(_pose(x=0.25), 20.0, False) is None
+    assert jumped.update(_pose(x=0.30), 20.0, False) is None
+    assert jumped.update(_pose(x=0.30), 20.0, False) is None
 
     blocked = TrialSession(min_trial_s=15, stable_frames=15)
     blocked.begin(0.0)
@@ -143,6 +146,8 @@ def test_drop_window_does_not_restart_the_clock():
     assert session.status == ""
     assert _fill(session, _pose(), 10.0) is None
     assert session.status.startswith("还需")
+    for now in np.arange(10.25, 15., .25):
+        assert session.update(_pose(), float(now), False) is None
     assert session.update(_pose(), 15.0, False) is not None
 
 

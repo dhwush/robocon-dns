@@ -49,6 +49,40 @@ class Plane:
 # 票数按地面上的格子计，近处挤在一起的像素不能把法向拉斜。
 # 方块顶面和地面平行，所以在通过重力检查的候选里取最低的一层，避免把顶面当成地面。
 
+
+class PlaneChangeGuard:
+    """车身系地面原点持续改变才确认换面，孤立抖动不清空观察。"""
+
+    def __init__(self, threshold_m=0.05, confirm_frames=3):
+        self.threshold_m = float(threshold_m)
+        self.confirm_frames = max(1, int(confirm_frames))
+        self.reference = None
+        self.pending = None
+        self.count = 0
+
+    def update(self, origin):
+        if origin is None:
+            self.pending, self.count = None, 0
+            return False
+        point = np.asarray(origin, dtype=float)
+        if point.shape != (3,) or not np.isfinite(point).all():
+            self.pending, self.count = None, 0
+            return False
+        if self.reference is None:
+            self.reference = point.copy()
+        if np.linalg.norm(point-self.reference) <= self.threshold_m:
+            self.pending, self.count = None, 0
+            return False
+        if self.pending is None or np.linalg.norm(point-self.pending) > self.threshold_m/2:
+            self.pending, self.count = point.copy(), 1
+        else:
+            self.count += 1
+        if self.count < self.confirm_frames:
+            return False
+        self.reference = point.copy()
+        self.pending, self.count = None, 0
+        return True
+
 def _plane_from_three(points: np.ndarray) -> tuple[np.ndarray, float] | None:
     # 三点叉乘得到法向。三点共线时叉乘接近 0，这个假设作废。
     v1 = points[1] - points[0]

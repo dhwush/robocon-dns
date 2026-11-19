@@ -27,9 +27,11 @@ import numpy as np
 
 from cube.detect import _color_layers
 from geom.transform import Intrinsics, deproject_pixels
+from angle_feedback import TOL_RAD
 
 
-_DEADBAND_RAD = np.deg2rad(3.0)
+# 规划与执行反馈共用死区，避免一层要求停止、另一层仍要求调整。
+_DEADBAND_RAD = TOL_RAD
 # 顶面正方形对角线。补到这个跨度，四个上角才有机会一起进画面。
 _DIAGONAL = float(np.sqrt(2.0))
 # 未识别时原地转角每拍最多这么多。再大容易把已经差不多能看见的方块转出画面。
@@ -551,7 +553,7 @@ def run_live(cfg: dict, intr: Intrinsics, serial: str | None, color_lock: dict |
     from camera.source import Frame, RealSenseSource, filter_depth
 
     from angle_feedback import RelativeStop
-    feedback = RelativeStop()
+    feedback = RelativeStop(timeout_s=float(cfg.get("adjust_timeout_s", 10.0)))
     source = RealSenseSource(
         intr.width,
         intr.height,
